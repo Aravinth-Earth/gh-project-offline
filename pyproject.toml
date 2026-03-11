@@ -1,0 +1,73 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gh-project-offline"
+version = "0.1.0"
+description = "Local-first cache for GitHub Project data with ad hoc and periodic sync."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "GPL-3.0-only"
+license-files = ["LICENSE"]
+authors = [
+  { name = "Aravinth Earth" }
+]
+maintainers = [
+  { name = "Aravinth Earth" }
+]
+keywords = ["github", "projects", "offline", "sqlite", "cli"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Database",
+  "Topic :: Software Development :: Libraries :: Python Modules",
+  "Topic :: Software Development :: Bug Tracking",
+]
+dependencies = [
+  "rich>=13.7",
+]
+
+[project.urls]
+Homepage = "https://github.com/Aravinth-Earth/gh-project-offline"
+Repository = "https://github.com/Aravinth-Earth/gh-project-offline"
+Issues = "https://github.com/Aravinth-Earth/gh-project-offline/issues"
+Changelog = "https://github.com/Aravinth-Earth/gh-project-offline/blob/main/CHANGELOG.md"
+Security = "https://github.com/Aravinth-Earth/gh-project-offline/blob/main/SECURITY.md"
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "pytest-cov>=5.0",
+  "ruff>=0.11.0",
+  "bandit[toml]>=1.8.0",
+  "build>=1.2.0",
+  "twine>=5.0.0",
+]
+
+[project.scripts]
+gh-project-offline = "gh_project_offline.cli:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["F", "I", "B", "UP"]
+
+[tool.bandit]
+exclude_dirs = ["tests", "build", "dist", ".venv"]

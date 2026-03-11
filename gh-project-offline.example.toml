@@ -1,0 +1,13 @@
+[github]
+project_url = "https://github.com/users/YOUR-OWNER/projects/123/views/1"
+token_env = "GITHUB_TOKEN"
+
+[storage]
+database_path = "data/cache.db"
+logs_dir = "logs"
+
+[sync]
+interval = "15m"
+timeout_seconds = 30
+user_agent = "gh-project-offline/0.1.0"
+include_closed_items = false
