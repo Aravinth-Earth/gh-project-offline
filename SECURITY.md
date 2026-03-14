@@ -21,6 +21,7 @@ Current design goals:
 
 - read-only sync from GitHub to local storage
 - avoid persisting the PAT automatically into system-wide environment variables
+- avoid writing PATs into `.env` files or other repository-local config files
 - keep logs and cache local to the machine
 - avoid writing secrets into logs
 
@@ -37,4 +38,6 @@ For public release, the safest default is:
 - prompt the user for a PAT when needed
 - use it only for the running process unless the user explicitly manages persistence outside the app
 
-The app should not silently write PATs into user or machine environment variables. That is convenient, but it expands the blast radius of a leaked token and makes accidental reuse more likely.
+The app should not silently write PATs into user or machine environment variables, `.env` files, or repo-local runtime files. That is convenient, but it expands the blast radius of a leaked token and makes accidental reuse more likely.
+
+This matters even more because some GitHub Project v2 read paths, especially for user-owned project views, may require a classic PAT rather than a narrower fine-grained token or GitHub App token.

@@ -33,7 +33,7 @@ What `start` does:
 - prompts for the PAT when the configured token env var is missing
 - validates access to the board
 - runs the first sync
-- offers to continue into watch mode
+- clearly asks whether you want to continue into watch mode after setup and the first sync complete
 - lets you keep or override the watch interval
 
 Useful `start` flags:
@@ -55,6 +55,14 @@ gh-project-offline start --project-url https://github.com/users/YOUR-OWNER/proje
 ```
 
 ## Main Commands
+
+Think of the CLI as three main operating modes:
+
+- `start`: guided setup plus the first sync, with an optional opt-in handoff into `watch`
+- `sync`: one manual refresh now, then exit
+- `watch`: continuous periodic sync until stopped
+
+`start` does not silently become continuous monitoring. It only enters `watch` if you explicitly opt in at the prompt.
 
 `doctor`
 
@@ -182,7 +190,9 @@ This keeps all app runtime files in one project-local folder so users can clearl
 ## Token Notes
 
 - the tool does not silently store your PAT into system environment variables
+- the tool also does not silently write the PAT into `.env` files or repo-local runtime files
 - the safest default is process-local use unless you choose your own persistence method
+- this is primarily a security choice, not just a convenience tradeoff
 - for user-owned Project v2 endpoints, a compatible classic personal access token is the safest starting point
 - if your board references private repos, you may also need repo read access
 
