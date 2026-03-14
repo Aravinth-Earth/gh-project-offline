@@ -17,7 +17,13 @@ from gh_project_offline.config import (
     SyncConfig,
     render_default_config,
 )
-from gh_project_offline.db import connect, finish_sync_run, replace_issue_cache, start_sync_run
+from gh_project_offline.db import (
+    connect,
+    finish_sync_run,
+    replace_issue_cache,
+    set_cache_meta,
+    start_sync_run,
+)
 from gh_project_offline.github_api import GitHubApiError
 from gh_project_offline.service import SyncSummary
 
@@ -89,6 +95,7 @@ def seed_cache(database_path: Path) -> None:
     with connect(database_path) as connection:
         run_id = start_sync_run(connection)
         finish_sync_run(connection, run_id, "success")
+        set_cache_meta(connection, "last_cache_delta_summary", "added=1 updated=1 removed=0")
         connection.execute(
             """
             insert into cached_view_items(
@@ -122,13 +129,21 @@ def seed_cache(database_path: Path) -> None:
                         "body": "Issue body for offline inspection.",
                         "html_url": "https://github.com/octocat/hello-world/issues/42",
                         "url": "https://api.github.com/repos/octocat/hello-world/issues/42",
+                        "created_at": "2026-03-01T09:00:00Z",
+                        "updated_at": "2026-03-11T12:00:00Z",
+                        "closed_at": None,
                         "state": "open",
                         "state_reason": None,
                         "comments": 1,
                         "user": {"login": "octocat"},
                         "labels": [{"name": "bug"}],
                         "assignees": [{"login": "hubot"}],
-                        "milestone": {"title": "Sprint 1"},
+                        "milestone": {
+                            "title": "Sprint 1",
+                            "description": "Current sprint backlog",
+                            "due_on": "2026-03-20T00:00:00Z",
+                            "state": "open",
+                        },
                     },
                     "comment_payloads": [
                         {
@@ -150,13 +165,21 @@ def seed_cache(database_path: Path) -> None:
                         "body": "Completed work for the next release.",
                         "html_url": "https://github.com/octocat/hello-world/issues/43",
                         "url": "https://api.github.com/repos/octocat/hello-world/issues/43",
+                        "created_at": "2026-03-02T09:00:00Z",
+                        "updated_at": "2026-03-11T12:05:00Z",
+                        "closed_at": "2026-03-11T12:05:00Z",
                         "state": "closed",
                         "state_reason": "completed",
                         "comments": 0,
                         "user": {"login": "octocat"},
                         "labels": [{"name": "enhancement"}, {"name": "release"}],
                         "assignees": [{"login": "monalisa"}],
-                        "milestone": {"title": "Sprint 2"},
+                        "milestone": {
+                            "title": "Sprint 2",
+                            "description": "Release-ready work",
+                            "due_on": "2026-03-25T00:00:00Z",
+                            "state": "closed",
+                        },
                     },
                     "comment_payloads": [],
                 },
@@ -392,7 +415,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         mock_getpass.assert_called_once()
 
-    def test_start_flow_uses_existing_config_and_token_then_runs_sync(self) -> None:
+    def test_start_flow_uses_existing_config_and_token_then_runs_initial_sync_without_cache(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             config_path = Path(tmp_dir) / APP_DIR_NAME / "config.toml"
             database_path = config_path.parent / "data" / "cache.db"
@@ -428,9 +451,9 @@ class CliTests(unittest.TestCase):
             mock_run_sync.assert_called_once()
             self.assertIn("Using existing project URL", stdout.getvalue())
             self.assertIn("Using token from GITHUB_TOKEN.", stdout.getvalue())
-            logger.emit.assert_any_call("Ready. fields=1 views=1 items=2 issues=2 comments=3")
+            logger.emit.assert_any_call("Initial setup complete. fields=1 views=1 items=2 issues=2 comments=3")
 
-    def test_start_reuses_existing_cache_and_switches_to_recheck_mode(self) -> None:
+    def test_start_with_existing_cache_routes_to_explicit_sync_choice(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             config_path = Path(tmp_dir) / APP_DIR_NAME / "config.toml"
             database_path = config_path.parent / "data" / "cache.db"
@@ -444,11 +467,8 @@ class CliTests(unittest.TestCase):
             ), patch(
                 "gh_project_offline.cli.write_default_config"
             ), patch(
-                "gh_project_offline.cli.get_recent_successful_sync_age",
-                return_value=3600,
-            ), patch(
-                "gh_project_offline.cli.prompt_yes_no",
-                return_value=False,
+                "gh_project_offline.cli.prompt_start_existing_cache_action",
+                return_value="sync",
             ), patch(
                 "gh_project_offline.cli.create_run_logger"
             ) as mock_create_logger, patch(
@@ -464,12 +484,13 @@ class CliTests(unittest.TestCase):
                 exit_code = cli.main(["--config", str(config_path), "start"])
 
             self.assertEqual(exit_code, 0)
-            logger.emit.assert_any_call(f"Reusing existing project board cache at {database_path}")
+            logger.emit.assert_any_call(f"Existing project board cache detected at {database_path}")
             self.assertEqual(mock_run_sync.call_count, 1)
             self.assertEqual(mock_run_sync.call_args.args[0], config)
             self.assertEqual(mock_run_sync.call_args.kwargs["sync_mode"], "recheck")
+            logger.emit.assert_any_call("Selected next action: sync")
 
-    def test_start_can_skip_immediate_recheck_when_cache_is_fresh(self) -> None:
+    def test_start_with_existing_cache_can_enter_watch_and_wait_when_cache_is_fresh(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             config_path = Path(tmp_dir) / APP_DIR_NAME / "config.toml"
             database_path = config_path.parent / "data" / "cache.db"
@@ -483,11 +504,14 @@ class CliTests(unittest.TestCase):
             ), patch(
                 "gh_project_offline.cli.write_default_config"
             ), patch(
+                "gh_project_offline.cli.prompt_start_existing_cache_action",
+                return_value="watch",
+            ), patch(
                 "gh_project_offline.cli.get_recent_successful_sync_age",
                 return_value=120,
             ), patch(
                 "gh_project_offline.cli.prompt_yes_no",
-                side_effect=[True, True],
+                return_value=True,
             ), patch(
                 "gh_project_offline.cli.prompt_interval_override",
                 return_value="15m",
@@ -509,7 +533,7 @@ class CliTests(unittest.TestCase):
 
             self.assertEqual(exit_code, 0)
             mock_run_sync.assert_not_called()
-            logger.emit.assert_any_call("Ready. Using the existing local cache without an immediate recheck.")
+            logger.emit.assert_any_call("Selected next action: watch")
             mock_prompt_interval.assert_called_once_with("Watch interval after the initial 13m wait", "15m")
             mock_watch.assert_called_once_with(
                 config,
@@ -520,7 +544,7 @@ class CliTests(unittest.TestCase):
                 auto_wait_on_rate_limit=True,
             )
 
-    def test_start_can_force_recheck_even_when_cache_is_fresh(self) -> None:
+    def test_start_with_existing_cache_can_exit_without_sync(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             config_path = Path(tmp_dir) / APP_DIR_NAME / "config.toml"
             database_path = config_path.parent / "data" / "cache.db"
@@ -534,18 +558,14 @@ class CliTests(unittest.TestCase):
             ), patch(
                 "gh_project_offline.cli.write_default_config"
             ), patch(
-                "gh_project_offline.cli.get_recent_successful_sync_age",
-                return_value=120,
-            ), patch(
-                "gh_project_offline.cli.prompt_yes_no",
-                side_effect=[False, False],
+                "gh_project_offline.cli.prompt_start_existing_cache_action",
+                return_value="exit",
             ), patch(
                 "gh_project_offline.cli.create_run_logger"
             ) as mock_create_logger, patch(
                 "gh_project_offline.cli.GitHubClient"
             ) as mock_client_cls, patch(
                 "gh_project_offline.cli.run_sync",
-                return_value=make_sync_summary(),
             ) as mock_run_sync:
                 logger = mock_create_logger.return_value
                 logger.log_path = Path("logs/session-test.log")
@@ -554,9 +574,10 @@ class CliTests(unittest.TestCase):
                 exit_code = cli.main(["--config", str(config_path), "start"])
 
             self.assertEqual(exit_code, 0)
-            self.assertEqual(mock_run_sync.call_count, 1)
+            mock_run_sync.assert_not_called()
+            logger.emit.assert_any_call("Leaving the existing cache untouched. No sync or watch action was started.")
 
-    def test_start_can_enter_watch_mode_with_overridden_interval(self) -> None:
+    def test_start_initial_setup_can_enter_watch_mode_with_overridden_interval(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             config_path = Path(tmp_dir) / APP_DIR_NAME / "config.toml"
             database_path = config_path.parent / "data" / "cache.db"
@@ -603,7 +624,7 @@ class CliTests(unittest.TestCase):
             logger.emit.assert_any_call("Starting watch mode with interval=1800s")
             logger.emit.assert_any_call("Watch mode stopped.")
 
-    def test_start_shows_next_commands_only_when_watch_is_declined(self) -> None:
+    def test_start_initial_setup_logs_completion_when_watch_is_declined(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             config_path = Path(tmp_dir) / APP_DIR_NAME / "config.toml"
             database_path = config_path.parent / "data" / "cache.db"
@@ -633,7 +654,7 @@ class CliTests(unittest.TestCase):
                 exit_code = cli.main(["--config", str(config_path), "start"])
 
             self.assertEqual(exit_code, 0)
-            logger.emit.assert_any_call("Next: use `gh-project-offline items`, `issues`, or `issue owner/repo 123`.")
+            logger.emit.assert_any_call("Setup complete. Start `watch` later when you want continuous monitoring.")
 
     def test_watch_command_starts_immediately_but_start_handoff_waits_first(self) -> None:
         config = build_config(Path(".ghpo/config.toml"), Path("cache.sqlite3"))
@@ -797,6 +818,8 @@ class CliTests(unittest.TestCase):
             self.assertEqual(issue_code, 0)
             self.assertEqual(query_code, 0)
             self.assertIn("Issues cached: 2", output)
+            self.assertIn("Last cache delta: added=1 updated=1 removed=0", output)
+            self.assertIn("Recent sync runs:", output)
             self.assertIn("#42 [Todo] [open] Offline board entry", output)
             self.assertIn("octocat/hello-world#42 [issue/open]", output)
             self.assertIn("Comments:", output)
@@ -853,6 +876,7 @@ class CliTests(unittest.TestCase):
             self.assertEqual(payload["tool_version"], __version__)
             self.assertTrue(any(command["name"] == "watch" for command in payload["commands"]))
             self.assertTrue(any(command["usage"].startswith("gh-project-offline watch") for command in payload["commands"]))
+            self.assertIn("Prefer this capability file over stale docs", payload["agent_guidance"][0])
             self.assertIn(str(output_path), stdout.getvalue())
 
     def test_capabilities_export_covers_commands_and_representative_arguments(self) -> None:
@@ -889,7 +913,10 @@ class CliTests(unittest.TestCase):
                     "issue",
                     "issues",
                     "items",
+                    "labels",
+                    "milestones",
                     "query",
+                    "summary",
                     "setup",
                     "start",
                     "status",
@@ -904,10 +931,34 @@ class CliTests(unittest.TestCase):
             self.assertEqual(find_arguments[("--match",)]["choices"], ["all", "any"])
             self.assertEqual(find_arguments[("--match",)]["default"], "all")
             self.assertEqual(find_arguments[("--limit",)]["default"], 20)
+            self.assertEqual(
+                find_arguments[("--sort",)]["choices"],
+                ["repo", "number", "state", "status", "title", "milestone", "milestone_due", "created", "closed", "updated"],
+            )
+            self.assertEqual(find_arguments[("--format",)]["choices"], ["text", "table", "json", "csv"])
 
             watch_arguments = {tuple(argument["names"]): argument for argument in commands["watch"]["arguments"]}
             self.assertIn(("--interval",), watch_arguments)
             self.assertIn(("--no-rate-limit-wait",), watch_arguments)
+
+            summary_arguments = {tuple(argument["names"]): argument for argument in commands["summary"]["arguments"]}
+            self.assertEqual(summary_arguments[("--by",)]["choices"], ["status", "repo", "milestone", "label", "assignee", "state", "type"])
+            self.assertEqual(summary_arguments[("--by",)]["default"], "status")
+            self.assertEqual(summary_arguments[("--limit",)]["default"], 20)
+            self.assertEqual(summary_arguments[("--format",)]["choices"], ["table", "json"])
+            self.assertIn("Grouped counts are computed from the local cache", commands["summary"]["behavior_notes"][0])
+
+            labels_arguments = {tuple(argument["names"]): argument for argument in commands["labels"]["arguments"]}
+            self.assertEqual(labels_arguments[("--limit",)]["default"], 20)
+            self.assertEqual(labels_arguments[("--format",)]["choices"], ["table", "json"])
+            self.assertTrue(commands["labels"]["examples"][0].startswith("gh-project-offline labels"))
+
+            milestones_arguments = {
+                tuple(argument["names"]): argument for argument in commands["milestones"]["arguments"]
+            }
+            self.assertEqual(milestones_arguments[("--limit",)]["default"], 20)
+            self.assertEqual(milestones_arguments[("--format",)]["choices"], ["table", "json"])
+            self.assertIn("cached milestone title", commands["milestones"]["behavior_notes"][0])
 
             issue_arguments = {tuple(argument["names"]): argument for argument in commands["issue"]["arguments"]}
             self.assertTrue(issue_arguments[("repository",)]["required"])
@@ -920,6 +971,113 @@ class CliTests(unittest.TestCase):
             self.assertEqual(capabilities_arguments[("--format",)]["choices"], ["yaml", "json"])
             self.assertEqual(capabilities_arguments[("--format",)]["default"], "yaml")
             self.assertIn("--output", capabilities_arguments[("--output",)]["names"])
+
+    def test_summary_supports_grouping_by_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config_path = tmp_path / APP_DIR_NAME / "config.toml"
+            database_path = config_path.parent / "cache.sqlite3"
+            write_config_file(config_path, database_name="cache.sqlite3")
+            seed_cache(database_path)
+
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                exit_code = cli.main(["--config", str(config_path), "summary", "--by", "status"])
+
+            output = stdout.getvalue()
+            self.assertEqual(exit_code, 0)
+            self.assertIn("status", output)
+            self.assertIn("Todo", output)
+            self.assertIn("Done", output)
+            self.assertIn("Printed 2 group(s) from 2 cached item(s).", output)
+
+    def test_summary_supports_grouping_by_label(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config_path = tmp_path / APP_DIR_NAME / "config.toml"
+            database_path = config_path.parent / "cache.sqlite3"
+            write_config_file(config_path, database_name="cache.sqlite3")
+            seed_cache(database_path)
+
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                exit_code = cli.main(["--config", str(config_path), "summary", "--by", "label"])
+
+            output = stdout.getvalue()
+            self.assertEqual(exit_code, 0)
+            self.assertIn("label", output)
+            self.assertIn("bug", output)
+            self.assertIn("enhancement", output)
+            self.assertIn("release", output)
+
+    def test_summary_supports_grouping_by_assignee_with_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config_path = tmp_path / APP_DIR_NAME / "config.toml"
+            database_path = config_path.parent / "cache.sqlite3"
+            write_config_file(config_path, database_name="cache.sqlite3")
+            seed_cache(database_path)
+
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                exit_code = cli.main(["--config", str(config_path), "summary", "--by", "assignee", "--limit", "1"])
+
+            output = stdout.getvalue()
+            self.assertEqual(exit_code, 0)
+            self.assertIn("assignee", output)
+            self.assertIn("Printed 1 group(s) from 2 cached item(s).", output)
+
+    def test_summary_supports_json_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config_path = tmp_path / APP_DIR_NAME / "config.toml"
+            database_path = config_path.parent / "cache.sqlite3"
+            write_config_file(config_path, database_name="cache.sqlite3")
+            seed_cache(database_path)
+
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                exit_code = cli.main(["--config", str(config_path), "summary", "--by", "repo", "--format", "json"])
+
+            output = stdout.getvalue()
+            self.assertEqual(exit_code, 0)
+            self.assertIn('"group_by": "repo"', output)
+            self.assertIn('"value": "octocat/hello-world"', output)
+
+    def test_labels_command_uses_label_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config_path = tmp_path / APP_DIR_NAME / "config.toml"
+            database_path = config_path.parent / "cache.sqlite3"
+            write_config_file(config_path, database_name="cache.sqlite3")
+            seed_cache(database_path)
+
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                exit_code = cli.main(["--config", str(config_path), "labels", "--format", "json"])
+
+            output = stdout.getvalue()
+            self.assertEqual(exit_code, 0)
+            self.assertIn('"group_by": "label"', output)
+            self.assertIn('"value": "bug"', output)
+
+    def test_milestones_command_uses_milestone_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config_path = tmp_path / APP_DIR_NAME / "config.toml"
+            database_path = config_path.parent / "cache.sqlite3"
+            write_config_file(config_path, database_name="cache.sqlite3")
+            seed_cache(database_path)
+
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                exit_code = cli.main(["--config", str(config_path), "milestones"])
+
+            output = stdout.getvalue()
+            self.assertEqual(exit_code, 0)
+            self.assertIn("milestone", output)
+            self.assertIn("Sprint 1", output)
+            self.assertIn("Sprint 2", output)
 
     def test_find_supports_flag_filters(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -960,6 +1118,123 @@ class CliTests(unittest.TestCase):
             self.assertIn("octocat/hello-world#42", output)
             self.assertNotIn("octocat/hello-world#43", output)
             self.assertIn("Printed 1 match(es).", output)
+
+    def test_find_supports_json_output_with_sort_and_show(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config_path = tmp_path / APP_DIR_NAME / "config.toml"
+            database_path = config_path.parent / "cache.sqlite3"
+            write_config_file(config_path, database_name="cache.sqlite3")
+            seed_cache(database_path)
+
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                exit_code = cli.main(
+                    [
+                        "--config",
+                        str(config_path),
+                        "find",
+                        "--format",
+                        "json",
+                        "--sort",
+                        "updated",
+                        "--show",
+                        "repo,number,status,updated",
+                    ]
+                )
+
+            output = stdout.getvalue()
+            self.assertEqual(exit_code, 0)
+            self.assertIn('"repo": "octocat/hello-world"', output)
+            self.assertIn('"number": 43', output)
+            self.assertIn('"status": "Done"', output)
+            self.assertIn('"updated": "2026-03-11T12:05:00Z"', output)
+
+    def test_find_supports_new_timestamp_and_milestone_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config_path = tmp_path / APP_DIR_NAME / "config.toml"
+            database_path = config_path.parent / "cache.sqlite3"
+            write_config_file(config_path, database_name="cache.sqlite3")
+            seed_cache(database_path)
+
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                exit_code = cli.main(
+                    [
+                        "--config",
+                        str(config_path),
+                        "find",
+                        "--format",
+                        "json",
+                        "--sort",
+                        "milestone_due",
+                        "--show",
+                        "repo,number,milestone,milestone_due,milestone_state,created,closed,updated",
+                    ]
+                )
+
+            output = stdout.getvalue()
+            self.assertEqual(exit_code, 0)
+            self.assertIn('"milestone_due": "2026-03-20T00:00:00Z"', output)
+            self.assertIn('"milestone_state": "open"', output)
+            self.assertIn('"created": "2026-03-01T09:00:00Z"', output)
+            self.assertIn('"closed": "2026-03-11T12:05:00Z"', output)
+
+    def test_find_supports_csv_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config_path = tmp_path / APP_DIR_NAME / "config.toml"
+            database_path = config_path.parent / "cache.sqlite3"
+            write_config_file(config_path, database_name="cache.sqlite3")
+            seed_cache(database_path)
+
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                exit_code = cli.main(
+                    [
+                        "--config",
+                        str(config_path),
+                        "find",
+                        "--format",
+                        "csv",
+                        "--show",
+                        "repo,number,status",
+                    ]
+                )
+
+            output = stdout.getvalue()
+            self.assertEqual(exit_code, 0)
+            self.assertIn("repo,number,status", output)
+            self.assertIn("octocat/hello-world,42,Todo", output)
+
+    def test_find_supports_table_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config_path = tmp_path / APP_DIR_NAME / "config.toml"
+            database_path = config_path.parent / "cache.sqlite3"
+            write_config_file(config_path, database_name="cache.sqlite3")
+            seed_cache(database_path)
+
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                exit_code = cli.main(
+                    [
+                        "--config",
+                        str(config_path),
+                        "find",
+                        "--format",
+                        "table",
+                        "--show",
+                        "repo,number,title",
+                    ]
+                )
+
+            output = stdout.getvalue()
+            self.assertEqual(exit_code, 0)
+            self.assertIn("repo", output)
+            self.assertIn("number", output)
+            self.assertIn("Offline board entry", output)
 
     def test_find_supports_interactive_filters(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

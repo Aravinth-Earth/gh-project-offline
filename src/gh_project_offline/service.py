@@ -15,12 +15,14 @@ from .db import (
     fetch_cached_comment_index,
     fetch_cached_issue_index,
     finish_sync_run,
+    get_cache_meta,
     project_key,
     replace_issue_cache,
     replace_project_fields,
     replace_project_snapshot,
     replace_project_views,
     replace_view_items,
+    set_cache_meta,
     start_sync_run,
 )
 from .github_api import GitHubApiError, GitHubClient
@@ -131,6 +133,11 @@ def run_sync(
                 f"updated={updated_issue_records} "
                 f"removed={removed_issue_records}"
             )
+            set_cache_meta(
+                connection,
+                "last_cache_delta_summary",
+                f"added={added_issue_records} updated={updated_issue_records} removed={removed_issue_records}",
+            )
             return SyncSummary(
                 fields_count=len(field_payloads),
                 views_count=len(view_payloads),
@@ -160,6 +167,9 @@ def fetch_status_rows(connection: sqlite3.Connection) -> dict[str, sqlite3.Row |
         "last_run": connection.execute(
             "select * from sync_runs order by id desc limit 1"
         ).fetchone(),
+        "recent_runs": connection.execute(
+            "select * from sync_runs order by id desc limit 5"
+        ).fetchall(),
         "project": connection.execute(
             "select * from project_snapshot order by updated_at desc limit 1"
         ).fetchone(),
@@ -168,6 +178,7 @@ def fetch_status_rows(connection: sqlite3.Connection) -> dict[str, sqlite3.Row |
         "item_count": connection.execute("select count(*) as count from cached_view_items").fetchone(),
         "issue_count": connection.execute("select count(*) as count from cached_issue_details").fetchone(),
         "comment_count": connection.execute("select count(*) as count from cached_issue_comments").fetchone(),
+        "last_cache_delta_summary": get_cache_meta(connection, "last_cache_delta_summary"),
     }
 
 

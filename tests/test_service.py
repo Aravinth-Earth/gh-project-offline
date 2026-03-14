@@ -202,11 +202,15 @@ class ServiceTests(unittest.TestCase):
                 issue_count = connection.execute("select count(*) as count from cached_issue_details").fetchone()["count"]
                 comment_count = connection.execute("select count(*) as count from cached_issue_comments").fetchone()["count"]
                 last_run = connection.execute("select status from sync_runs order by id desc limit 1").fetchone()["status"]
+                last_delta = connection.execute(
+                    "select value from cache_meta where key = 'last_cache_delta_summary'"
+                ).fetchone()["value"]
 
             self.assertEqual(item_count, 1)
             self.assertEqual(issue_count, 1)
             self.assertEqual(comment_count, 1)
             self.assertEqual(last_run, "success")
+            self.assertEqual(last_delta, "added=1 updated=0 removed=0")
             self.assertTrue(any("GitHub rate limit: remaining=4999/5000" in message for message in messages))
             self.assertIn("Fetched 1 project field(s).", messages)
             self.assertIn("Fetched 1 project view definition(s).", messages)

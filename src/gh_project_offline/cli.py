@@ -10,6 +10,7 @@ import sqlite3
 import sys
 import time
 import traceback
+from collections import Counter
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -231,6 +232,55 @@ def build_parser() -> argparse.ArgumentParser:
     find_parser.add_argument("--match", choices=["all", "any"], default="all", help="How repeated label or assignee filters should match.")
     find_parser.add_argument("--limit", type=int, default=20, help="Maximum number of matches to print.")
     find_parser.add_argument("--interactive", action="store_true", help="Build filters through prompts instead of flags alone.")
+    find_parser.add_argument(
+        "--sort",
+        choices=["repo", "number", "state", "status", "title", "milestone", "milestone_due", "created", "closed", "updated"],
+        default="repo",
+        help="Sort field for printed results.",
+    )
+    find_parser.add_argument(
+        "--format",
+        choices=["text", "table", "json", "csv"],
+        default="text",
+        help="Output format for matching results.",
+    )
+    find_parser.add_argument(
+        "--show",
+        help="Comma-separated output fields for table, json, or csv output.",
+    )
+
+    summary_parser = subparsers.add_parser("summary", help="Show cached counts grouped by a chosen field.")
+    summary_parser.add_argument(
+        "--by",
+        choices=["status", "repo", "milestone", "label", "assignee", "state", "type"],
+        default="status",
+        help="Field to group cached results by.",
+    )
+    summary_parser.add_argument("--limit", type=int, default=20, help="Maximum number of grouped rows to print.")
+    summary_parser.add_argument(
+        "--format",
+        choices=["table", "json"],
+        default="table",
+        help="Output format for grouped results.",
+    )
+
+    labels_parser = subparsers.add_parser("labels", help="Show cached label counts.")
+    labels_parser.add_argument("--limit", type=int, default=20, help="Maximum number of labels to print.")
+    labels_parser.add_argument(
+        "--format",
+        choices=["table", "json"],
+        default="table",
+        help="Output format for label results.",
+    )
+
+    milestones_parser = subparsers.add_parser("milestones", help="Show cached milestone counts.")
+    milestones_parser.add_argument("--limit", type=int, default=20, help="Maximum number of milestones to print.")
+    milestones_parser.add_argument(
+        "--format",
+        choices=["table", "json"],
+        default="table",
+        help="Output format for milestone results.",
+    )
 
     issue_parser = subparsers.add_parser("issue", help="Show one cached issue plus recent comments.")
     issue_parser.add_argument("repository", help="Repository full name, like owner/repo.")
@@ -412,10 +462,28 @@ def main(argv: list[str] | None = None) -> int:
             with connect(config.storage.database_path) as connection:
                 filters = gather_find_filters(args, connection=connection)
                 rows = fetch_find_rows(connection, limit=args.limit)
-            matched_rows = apply_find_filters(rows, filters)[: args.limit]
-            for row in matched_rows:
-                print_found_issue(row)
-            console_print(f"Printed {len(matched_rows)} match(es).")
+            matched_rows = apply_find_filters(rows, filters)
+            sorted_rows = sort_find_rows(matched_rows, sort_by=args.sort)[: args.limit]
+            render_find_results(sorted_rows, output_format=args.format, show_fields=args.show)
+            console_print(f"Printed {len(sorted_rows)} match(es).")
+            return 0
+
+        if args.command == "summary":
+            with connect(config.storage.database_path) as connection:
+                rows = fetch_find_rows(connection, limit=10000)
+            print_summary(rows, group_by=args.by, limit=args.limit, output_format=args.format)
+            return 0
+
+        if args.command == "labels":
+            with connect(config.storage.database_path) as connection:
+                rows = fetch_find_rows(connection, limit=10000)
+            print_summary(rows, group_by="label", limit=args.limit, output_format=args.format)
+            return 0
+
+        if args.command == "milestones":
+            with connect(config.storage.database_path) as connection:
+                rows = fetch_find_rows(connection, limit=10000)
+            print_summary(rows, group_by="milestone", limit=args.limit, output_format=args.format)
             return 0
 
         if args.command == "issue":
@@ -491,12 +559,21 @@ def print_status(rows: dict[str, sqlite3.Row | None], database_path: Path) -> No
             console_print(f"Last error: {last_run['error_message']}")
     else:
         console_print("Last sync: none")
+    if rows.get("last_cache_delta_summary"):
+        console_print(f"Last cache delta: {rows['last_cache_delta_summary']}")
     console_print(f"Projects cached: {1 if rows['project'] else 0}")
     console_print(f"Fields cached: {rows['field_count']['count'] if rows['field_count'] else 0}")
     console_print(f"Views cached: {rows['view_count']['count'] if rows['view_count'] else 0}")
     console_print(f"Items cached: {rows['item_count']['count'] if rows['item_count'] else 0}")
     console_print(f"Issues cached: {rows['issue_count']['count'] if rows['issue_count'] else 0}")
     console_print(f"Comments cached: {rows['comment_count']['count'] if rows['comment_count'] else 0}")
+    recent_runs = rows.get("recent_runs") or []
+    if recent_runs:
+        console_print("Recent sync runs:")
+        for run in recent_runs:
+            console_print(
+                f"- {run['status']} started={run['started_at']} finished={run['finished_at'] or '-'}"
+            )
 
 
 def print_rows(cursor: sqlite3.Cursor) -> None:
@@ -521,6 +598,60 @@ def default_capabilities_output_path(config_path: Path, output_format: str) -> P
 
 
 def build_capabilities_payload(parser: argparse.ArgumentParser) -> dict[str, Any]:
+    command_behavior_notes = {
+        "capabilities": [
+            "Generated from the installed CLI parser, so new commands and flags appear automatically after upgrade.",
+            "This export captures command and flag shape plus selected behavior notes, but not every internal implementation detail.",
+        ],
+        "find": [
+            "Text output prints a richer human summary; table, json, and csv output respect --show.",
+            "The updated sort uses cached remote_updated_at in descending order when that timestamp is available.",
+        ],
+        "summary": [
+            "Grouped counts are computed from the local cache and do not make live GitHub calls.",
+        ],
+        "labels": [
+            "Label counts are derived from cached issue labels, not from a separate label catalog endpoint.",
+        ],
+        "milestones": [
+            "Milestone counts are currently grouped by cached milestone title only.",
+        ],
+        "status": [
+            "Shows cache counts, the latest sync result, the latest cache delta summary, and a short recent sync history.",
+        ],
+        "start": [
+            "When no cache exists, start performs setup plus initial load, then can hand off into watch.",
+            "When cache already exists, start acts as a router and asks whether to run one-time sync, continuous watch, or exit.",
+        ],
+        "watch": [
+            "By default, watch waits for GitHub rate-limit reset and then resumes the normal interval.",
+        ],
+    }
+    command_examples = {
+        "capabilities": [
+            "gh-project-offline capabilities --format yaml",
+            "gh-project-offline capabilities --format json --output .ghpo/agent-capabilities.json",
+        ],
+        "find": [
+            'gh-project-offline find --label bug --state open --format table --show repo,number,title,status',
+            'gh-project-offline find --format json --sort updated --show repo,number,status,updated',
+        ],
+        "summary": [
+            "gh-project-offline summary --by status",
+            "gh-project-offline summary --by repo --format json",
+        ],
+        "labels": [
+            "gh-project-offline labels",
+            "gh-project-offline labels --format json",
+        ],
+        "milestones": [
+            "gh-project-offline milestones",
+            "gh-project-offline milestones --format json",
+        ],
+        "status": [
+            "gh-project-offline status",
+        ],
+    }
     command_parser = {
         action.dest: action
         for action in parser._actions
@@ -538,6 +669,8 @@ def build_capabilities_payload(parser: argparse.ArgumentParser) -> dict[str, Any
                 "name": command_name,
                 "summary": command_summaries.get(command_name, "") or "",
                 "usage": command_parser.format_usage().strip().replace("usage: ", ""),
+                "behavior_notes": command_behavior_notes.get(command_name, []),
+                "examples": command_examples.get(command_name, []),
                 "arguments": collect_parser_arguments(command_parser),
             }
         )
@@ -547,13 +680,18 @@ def build_capabilities_payload(parser: argparse.ArgumentParser) -> dict[str, Any
         "tool_name": "gh-project-offline",
         "tool_version": __version__,
         "purpose": "Local-first cache for GitHub Project data with offline inspection commands.",
+        "agent_guidance": [
+            "Prefer this capability file over stale docs when deciding which commands or flags are available.",
+            "Use sync or watch before making decisions that depend on fresh GitHub data.",
+            "Read behavior_notes and examples for semantics that are not obvious from the parser alone.",
+        ],
         "runtime_paths": {
             "config": str(DEFAULT_CONFIG_PATH),
             "database_default": ".ghpo/data/cache.db",
             "logs_default": ".ghpo/logs/",
         },
         "command_roles": {
-            "start": "Guided setup plus first sync, with optional handoff into watch.",
+            "start": "Guided setup and routing command. Performs initial load only when cache does not already exist.",
             "sync": "Run one sync now, then exit.",
             "watch": "Run sync on an interval until stopped.",
         },
@@ -641,11 +779,16 @@ def fetch_find_rows(connection: sqlite3.Connection, *, limit: int) -> list[sqlit
             detail.title,
             detail.body,
             detail.milestone_title,
+            detail.milestone_due_on,
+            detail.milestone_state,
             detail.labels_json,
             detail.assignees_json,
             detail.comments_count,
             item.status_name,
-            item.issue_title
+            item.issue_title,
+            detail.created_at,
+            detail.closed_at,
+            detail.remote_updated_at
         from cached_issue_details as detail
         left join cached_view_items as item
           on item.project_key = detail.project_key
@@ -656,6 +799,59 @@ def fetch_find_rows(connection: sqlite3.Connection, *, limit: int) -> list[sqlit
         """,
         (query_limit,),
     ).fetchall()
+
+
+def summarize_rows(rows: list[sqlite3.Row], *, group_by: str) -> list[tuple[str, int]]:
+    counts: Counter[str] = Counter()
+    for row in rows:
+        if group_by == "status":
+            counts[row["status_name"] or "(none)"] += 1
+        elif group_by == "repo":
+            counts[row["repository_name"] or "(none)"] += 1
+        elif group_by == "milestone":
+            milestone = row["milestone_title"] or "(none)"
+            due_on = row["milestone_due_on"] or ""
+            counts[f"{milestone} ({due_on})" if due_on else milestone] += 1
+        elif group_by == "state":
+            counts[row["state"] or "(none)"] += 1
+        elif group_by == "type":
+            counts[row["issue_type"] or "(none)"] += 1
+        elif group_by == "label":
+            labels = json.loads(row["labels_json"])
+            if not labels:
+                counts["(none)"] += 1
+            for label in labels:
+                counts[label.get("name", "?")] += 1
+        elif group_by == "assignee":
+            assignees = json.loads(row["assignees_json"])
+            if not assignees:
+                counts["(none)"] += 1
+            for assignee in assignees:
+                counts[assignee.get("login", "?")] += 1
+    return sorted(counts.items(), key=lambda item: (-item[1], item[0].lower()))
+
+
+def print_summary(rows: list[sqlite3.Row], *, group_by: str, limit: int, output_format: str) -> None:
+    grouped_rows = summarize_rows(rows, group_by=group_by)[:limit]
+    if output_format == "json":
+        print(
+            json.dumps(
+                {
+                    "group_by": group_by,
+                    "rows": [{"value": value, "count": count} for value, count in grouped_rows],
+                },
+                indent=2,
+            )
+        )
+        console_print(f"Printed {len(grouped_rows)} group(s) from {len(rows)} cached item(s).")
+        return
+    table = Table(show_header=True, header_style="bold")
+    table.add_column(group_by)
+    table.add_column("count", justify="right")
+    for value, count in grouped_rows:
+        table.add_row(value, str(count))
+    CONSOLE.print(table)
+    console_print(f"Printed {len(grouped_rows)} group(s) from {len(rows)} cached item(s).")
 
 
 def gather_find_filters(args: argparse.Namespace, *, connection: sqlite3.Connection | None = None) -> dict[str, Any]:
@@ -748,6 +944,32 @@ def apply_find_filters(rows: list[sqlite3.Row], filters: dict[str, Any]) -> list
     return matched_rows
 
 
+def sort_find_rows(rows: list[sqlite3.Row], *, sort_by: str) -> list[sqlite3.Row]:
+    def value(row: sqlite3.Row) -> tuple[Any, ...]:
+        if sort_by == "number":
+            return (int(row["issue_number"] or 0), (row["repository_name"] or "").lower())
+        if sort_by == "state":
+            return ((row["state"] or "").lower(), (row["repository_name"] or "").lower(), int(row["issue_number"] or 0))
+        if sort_by == "status":
+            return ((row["status_name"] or "").lower(), (row["repository_name"] or "").lower(), int(row["issue_number"] or 0))
+        if sort_by == "title":
+            return ((row["title"] or "").lower(), (row["repository_name"] or "").lower(), int(row["issue_number"] or 0))
+        if sort_by == "milestone":
+            return ((row["milestone_title"] or "").lower(), (row["repository_name"] or "").lower(), int(row["issue_number"] or 0))
+        if sort_by == "milestone_due":
+            return ((row["milestone_due_on"] or ""), (row["repository_name"] or "").lower(), int(row["issue_number"] or 0))
+        if sort_by == "created":
+            return ((row["created_at"] or ""), (row["repository_name"] or "").lower(), int(row["issue_number"] or 0))
+        if sort_by == "closed":
+            return ((row["closed_at"] or ""), (row["repository_name"] or "").lower(), int(row["issue_number"] or 0))
+        if sort_by == "updated":
+            return ((row["remote_updated_at"] or ""), (row["repository_name"] or "").lower(), int(row["issue_number"] or 0))
+        return ((row["repository_name"] or "").lower(), int(row["issue_number"] or 0))
+
+    reverse = sort_by in {"updated", "created", "closed"}
+    return sorted(rows, key=value, reverse=reverse)
+
+
 def values_match(actual_values: list[str], wanted_values: list[str], match_mode: str) -> bool:
     actual = set(actual_values)
     if match_mode == "any":
@@ -767,6 +989,100 @@ def print_found_issue(row: sqlite3.Row) -> None:
         f"{row['title'] or '<no title>'} "
         f"milestone={milestone} assignees={assignees} labels={labels} comments={row['comments_count']}"
     )
+
+
+DEFAULT_FIND_SHOW_FIELDS = [
+    "repo",
+    "number",
+    "type",
+    "state",
+    "status",
+    "title",
+    "milestone",
+    "milestone_due",
+    "assignees",
+    "labels",
+    "comments",
+    "created",
+    "updated",
+]
+
+
+def parse_find_show_fields(value: str | None) -> list[str]:
+    if not value:
+        return DEFAULT_FIND_SHOW_FIELDS.copy()
+    allowed = {
+        "repo",
+        "number",
+        "type",
+        "state",
+        "status",
+        "title",
+        "milestone",
+        "milestone_due",
+        "milestone_state",
+        "assignees",
+        "labels",
+        "comments",
+        "created",
+        "closed",
+        "updated",
+    }
+    selected: list[str] = []
+    for part in value.split(","):
+        field = part.strip().lower()
+        if field and field in allowed and field not in selected:
+            selected.append(field)
+    return selected or DEFAULT_FIND_SHOW_FIELDS.copy()
+
+
+def render_find_results(rows: list[sqlite3.Row], *, output_format: str, show_fields: str | None) -> None:
+    if output_format == "text":
+        for row in rows:
+            print_found_issue(row)
+        return
+    fields = parse_find_show_fields(show_fields)
+    serialized = [serialize_find_row(row, fields=fields) for row in rows]
+    if output_format == "json":
+        print(json.dumps(serialized, indent=2))
+        return
+    if output_format == "csv":
+        import csv
+
+        writer = csv.DictWriter(sys.stdout, fieldnames=fields)
+        writer.writeheader()
+        for item in serialized:
+            writer.writerow(item)
+        return
+    table = Table(show_header=True, header_style="bold")
+    for field in fields:
+        table.add_column(field)
+    for item in serialized:
+        table.add_row(*[str(item.get(field, "")) for field in fields])
+    CONSOLE.print(table)
+
+
+def serialize_find_row(row: sqlite3.Row, *, fields: list[str]) -> dict[str, Any]:
+    labels = ", ".join(label.get("name", "?") for label in json.loads(row["labels_json"] or "[]")) or "-"
+    assignees = ", ".join(assignee.get("login", "?") for assignee in json.loads(row["assignees_json"] or "[]")) or "-"
+    mapping = {
+        "repo": row["repository_name"] or "",
+        "number": row["issue_number"] or "",
+        "type": row["issue_type"] or "",
+        "state": row["state"] or "",
+        "status": row["status_name"] or "",
+        "title": row["title"] or "",
+        "milestone": row["milestone_title"] or "",
+        "milestone_due": row["milestone_due_on"] or "",
+        "milestone_state": row["milestone_state"] or "",
+        "assignees": assignees,
+        "labels": labels,
+        "comments": row["comments_count"] or 0,
+        "created": row["created_at"] or "",
+        "closed": row["closed_at"] or "",
+        "updated": row["remote_updated_at"] or "",
+    }
+    return {field: mapping[field] for field in fields}
 
 
 def clean_optional_text(value: str | None) -> str | None:
@@ -1006,13 +1322,13 @@ def run_start_flow(args: argparse.Namespace) -> int:
         token = prompt_token(config, force=args.force)
         os.environ[config.github.token_env] = token
 
-        sync_mode = "initial_load"
+        cache_exists = False if args.force else has_existing_cache(config.storage.database_path)
         if args.force:
             reset_database(config.storage.database_path)
-            logger.emit("Forced reset requested. Local cache was cleared before sync.")
-        elif existing_config and has_existing_cache(config.storage.database_path):
-            sync_mode = "recheck"
-            logger.emit(f"Reusing existing project board cache at {config.storage.database_path}")
+            cache_exists = False
+            logger.emit("Forced reset requested. Local cache was cleared before setup.")
+        elif cache_exists:
+            logger.emit(f"Existing project board cache detected at {config.storage.database_path}")
         else:
             logger.emit("No reusable local board cache found. Starting initial load.")
 
@@ -1025,66 +1341,92 @@ def run_start_flow(args: argparse.Namespace) -> int:
             raise
         logger.emit("GitHub access check passed.")
 
-        interval_seconds = parse_interval(config.sync.interval)
-        recent_sync = get_recent_successful_sync_age(config.storage.database_path)
-        should_run_sync = True
-        wait_before_first_watch_cycle = True
-        first_watch_wait_seconds: int | None = None
-        if sync_mode == "recheck" and recent_sync is not None and recent_sync < interval_seconds:
-            remaining_seconds = max(interval_seconds - recent_sync, 0)
-            logger.emit(
-                f"Local cache freshness: last successful sync was {format_duration(recent_sync)} ago, "
-                f"inside the configured {config.sync.interval} interval."
-            )
-            should_wait = prompt_yes_no(
-                f"Local cache is fresh. Wait about {format_duration(remaining_seconds)} before the next recheck?",
-                default=True,
-            )
-            should_run_sync = not should_wait
-            if should_wait:
-                logger.emit(
-                    f"Skipping immediate recheck. Cache is recent; about {format_duration(remaining_seconds)} remains in this sync window."
-                )
-                wait_before_first_watch_cycle = True
-                first_watch_wait_seconds = remaining_seconds
-
-        if should_run_sync:
+        if not cache_exists:
             with SyncProgressRenderer() as renderer:
                 summary = run_sync(
                     config,
                     progress=lambda message: emit_sync_feedback(message, logger=logger, renderer=renderer),
-                    sync_mode=sync_mode,
+                    sync_mode="initial_load",
                 )
             logger.emit(
-                "Ready. "
+                "Initial setup complete. "
                 f"fields={summary.fields_count} views={summary.views_count} "
                 f"items={summary.items_count} issues={summary.issues_count} comments={summary.comments_count}"
             )
+            should_start_watch = prompt_yes_no("Initial setup is complete. Start watch mode now?", default=True)
+            if should_start_watch:
+                interval_value = prompt_interval_override("Watch interval", config.sync.interval)
+                interval_seconds = parse_interval(interval_value)
+                logger.emit(f"Starting watch mode with interval={interval_seconds}s")
+                try:
+                    run_watch_loop(
+                        config,
+                        interval_seconds,
+                        logger=logger,
+                        wait_before_first_cycle=True,
+                        first_wait_seconds=None,
+                        auto_wait_on_rate_limit=not args.no_rate_limit_wait,
+                    )
+                except KeyboardInterrupt:
+                    logger.emit("Watch mode stopped.")
+            else:
+                logger.emit("Setup complete. Start `watch` later when you want continuous monitoring.")
         else:
-            logger.emit("Ready. Using the existing local cache without an immediate recheck.")
-        should_start_watch = prompt_yes_no("Start watch mode now?", default=True)
-        if should_start_watch:
-            interval_prompt = "Watch interval"
-            if first_watch_wait_seconds is not None:
-                interval_prompt = (
-                    f"Watch interval after the initial {format_duration(first_watch_wait_seconds)} wait"
+            logger.emit("Setup is already complete. Start will not run a sync automatically while cache exists.")
+            action = prompt_start_existing_cache_action()
+            logger.emit(f"Selected next action: {action}")
+            if action == "sync":
+                with SyncProgressRenderer() as renderer:
+                    summary = run_sync(
+                        config,
+                        progress=lambda message: emit_sync_feedback(message, logger=logger, renderer=renderer),
+                        sync_mode="recheck",
+                    )
+                logger.emit(
+                    "One-time sync complete. "
+                    f"fields={summary.fields_count} views={summary.views_count} "
+                    f"items={summary.items_count} issues={summary.issues_count} comments={summary.comments_count}"
                 )
-            interval_value = prompt_interval_override(interval_prompt, config.sync.interval)
-            interval_seconds = parse_interval(interval_value)
-            logger.emit(f"Starting watch mode with interval={interval_seconds}s")
-            try:
-                run_watch_loop(
-                    config,
-                    interval_seconds,
-                    logger=logger,
-                    wait_before_first_cycle=wait_before_first_watch_cycle,
-                    first_wait_seconds=first_watch_wait_seconds,
-                    auto_wait_on_rate_limit=not args.no_rate_limit_wait,
-                )
-            except KeyboardInterrupt:
-                logger.emit("Watch mode stopped.")
-        else:
-            logger.emit("Next: use `gh-project-offline items`, `issues`, or `issue owner/repo 123`.")
+            elif action == "watch":
+                interval_seconds = parse_interval(config.sync.interval)
+                recent_sync = get_recent_successful_sync_age(config.storage.database_path)
+                wait_before_first_watch_cycle = False
+                first_watch_wait_seconds: int | None = None
+                if recent_sync is not None and recent_sync < interval_seconds:
+                    remaining_seconds = max(interval_seconds - recent_sync, 0)
+                    logger.emit(
+                        f"Local cache freshness: last successful sync was {format_duration(recent_sync)} ago, "
+                        f"inside the configured {config.sync.interval} interval."
+                    )
+                    should_wait = prompt_yes_no(
+                        f"Local cache is fresh. Wait about {format_duration(remaining_seconds)} before the first watch recheck?",
+                        default=True,
+                    )
+                    if should_wait:
+                        logger.emit(
+                            f"Watch will wait about {format_duration(remaining_seconds)} before the first recheck."
+                        )
+                        wait_before_first_watch_cycle = True
+                        first_watch_wait_seconds = remaining_seconds
+                interval_prompt = "Watch interval"
+                if first_watch_wait_seconds is not None:
+                    interval_prompt = f"Watch interval after the initial {format_duration(first_watch_wait_seconds)} wait"
+                interval_value = prompt_interval_override(interval_prompt, config.sync.interval)
+                interval_seconds = parse_interval(interval_value)
+                logger.emit(f"Starting watch mode with interval={interval_seconds}s")
+                try:
+                    run_watch_loop(
+                        config,
+                        interval_seconds,
+                        logger=logger,
+                        wait_before_first_cycle=wait_before_first_watch_cycle,
+                        first_wait_seconds=first_watch_wait_seconds,
+                        auto_wait_on_rate_limit=not args.no_rate_limit_wait,
+                    )
+                except KeyboardInterrupt:
+                    logger.emit("Watch mode stopped.")
+            else:
+                logger.emit("Leaving the existing cache untouched. No sync or watch action was started.")
         return 0
     except BaseException as exc:
         log_runtime_failure(logger, "Start flow failed", exc)
@@ -1165,6 +1507,23 @@ def prompt_yes_no(prompt: str, *, default: bool) -> bool:
         if entered in {"n", "no"}:
             return False
         console_print("Please answer yes or no.")
+
+
+def prompt_start_existing_cache_action() -> str:
+    console_print("Setup is already complete and cached data exists.")
+    console_print("Choose the next action:")
+    console_print("1. One-time sync")
+    console_print("2. Continuous watch")
+    console_print("3. Exit")
+    while True:
+        entered = input("Next action [1/2/3]: ").strip()
+        if entered == "1":
+            return "sync"
+        if entered == "2":
+            return "watch"
+        if entered == "3" or not entered:
+            return "exit"
+        console_print("Please enter 1, 2, or 3.")
 
 
 def prompt_interval_override(prompt_label: str, default_interval: str) -> str:

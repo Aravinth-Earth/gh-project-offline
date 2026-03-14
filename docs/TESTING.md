@@ -21,7 +21,7 @@ $env:GITHUB_TOKEN = "your-classic-pat"
 gh-project-offline start --project-url https://github.com/users/YOUR-OWNER/projects/123/views/1
 ```
 
-That writes `.ghpo/config.toml`, validates access, runs the first sync, creates a timestamped session log under `.ghpo/logs/`, and then explicitly asks whether you want to continue into watch mode.
+That writes `.ghpo/config.toml`, validates access, runs the first sync when cache does not already exist, creates a timestamped session log under `.ghpo/logs/`, and then explicitly asks whether you want to continue into watch mode.
 
 If the token is not already present in the configured env var, `start` will prompt for it without echoing it back to the terminal.
 
@@ -59,6 +59,7 @@ Expected result:
 
 - `start` reports counts for fields, views, items, issues, and comments
 - `status` shows the last sync as `success`
+- `status` shows the latest cache delta summary
 - item and issue counts are greater than zero for a populated board
 
 ## 6. Inspect the offline cache
@@ -82,6 +83,15 @@ Ad hoc SQL for humans or agents:
 gh-project-offline query "select repository_name, issue_number, title, state from cached_issue_details order by repository_name, issue_number limit 20"
 gh-project-offline query "select repository_name, issue_number, author_login, created_at from cached_issue_comments order by created_at desc limit 20"
 gh-project-offline query "select issue_number, issue_title, status_name, repository_name from cached_view_items order by status_name, issue_number limit 20"
+```
+
+Grouped reporting:
+
+```powershell
+gh-project-offline summary --by status
+gh-project-offline labels
+gh-project-offline milestones
+gh-project-offline find --format table --sort updated --show repo,number,status,updated
 ```
 
 ## 7. Try periodic sync

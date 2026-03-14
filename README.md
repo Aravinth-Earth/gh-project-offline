@@ -43,14 +43,15 @@ gh-project-offline start --project-url https://github.com/users/YOUR-OWNER/proje
 - prompt for the project URL when needed
 - prompt for the PAT when the configured env var is missing
 - validate access to the target project
-- run the first sync with live progress in the CLI
-- explicitly ask whether you want to continue into watch mode after setup and the first sync complete
+- perform the first sync only when the local cache does not already exist
+- explicitly ask whether you want to continue into watch mode after initial setup completes
+- route existing setups to an explicit next action: one-time sync, watch, or exit
 - let you keep or override the sync interval before watch starts
 - write runtime files under `.ghpo/`
 
 Command roles:
 
-- `start`: guided setup plus the first sync, with an optional handoff into `watch`
+- `start`: guided setup and routing command; it only performs initial load when cache does not already exist
 - `sync`: one manual sync run, then exit
 - `watch`: continuous periodic sync until stopped
 
@@ -78,7 +79,7 @@ logs_dir = "logs"
 [sync]
 interval = "15m"
 timeout_seconds = 30
-user_agent = "gh-project-offline/0.1.2"
+user_agent = "gh-project-offline/0.2.0"
 include_closed_items = false
 ```
 
@@ -94,9 +95,13 @@ You can still set `owner`, `owner_type`, `project_number`, and `view_number` exp
 - `gh-project-offline sync`
 - `gh-project-offline watch --interval 15m`
 - `gh-project-offline status`
+- `gh-project-offline summary --by status`
+- `gh-project-offline labels`
+- `gh-project-offline milestones --format json`
 - `gh-project-offline items`
 - `gh-project-offline issues`
 - `gh-project-offline find --label bug --state open --status "Todo"`
+- `gh-project-offline find --format table --sort updated --show repo,number,status,updated`
 - `gh-project-offline find --interactive`
 - `gh-project-offline issue owner/repo 123`
 - `gh-project-offline query "select * from cached_issue_details limit 5"`
@@ -114,6 +119,8 @@ The SQLite cache stores:
 - project views when the API exposes them
 - items for the configured view
 - hydrated issue or pull request details for repo-backed board items
+- milestone title, due date, description, and state when GitHub provides them
+- issue timestamps such as created, updated, and closed time
 - issue or pull request descriptions or bodies
 - issue comments
 - raw JSON payloads alongside normalized columns
