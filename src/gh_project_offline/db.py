@@ -59,6 +59,8 @@ create table if not exists cached_view_items (
     issue_number integer,
     issue_title text,
     status_name text,
+    status_field_name text,
+    status_option_id text,
     repository_name text,
     item_json text not null,
     updated_at text not null,
@@ -79,9 +81,14 @@ create table if not exists cached_issue_details (
     api_url text,
     author_login text,
     milestone_title text,
+    milestone_description text,
+    milestone_due_on text,
+    milestone_state text,
     labels_json text not null,
     assignees_json text not null,
     comments_count integer not null,
+    created_at text,
+    closed_at text,
     remote_updated_at text,
     issue_json text not null,
     updated_at text not null,
@@ -109,6 +116,22 @@ def utc_now() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def set_cache_meta(connection: sqlite3.Connection, key: str, value: str) -> None:
+    connection.execute(
+        """
+        insert into cache_meta(key, value)
+        values(?, ?)
+        on conflict(key) do update set value = excluded.value
+        """,
+        (key, value),
+    )
+
+
+def get_cache_meta(connection: sqlite3.Connection, key: str) -> str | None:
+    row = connection.execute("select value from cache_meta where key = ?", (key,)).fetchone()
+    return None if row is None else str(row["value"])
+
+
 def project_key(owner_type: str, owner: str, project_number: int) -> str:
     return f"{owner_type}:{owner}:{project_number}"
 
@@ -129,6 +152,13 @@ def connect(path: Path) -> Iterator[sqlite3.Connection]:
 
 def ensure_schema_upgrades(connection: sqlite3.Connection) -> None:
     add_column_if_missing(connection, "cached_issue_details", "remote_updated_at text")
+    add_column_if_missing(connection, "cached_view_items", "status_field_name text")
+    add_column_if_missing(connection, "cached_view_items", "status_option_id text")
+    add_column_if_missing(connection, "cached_issue_details", "milestone_description text")
+    add_column_if_missing(connection, "cached_issue_details", "milestone_due_on text")
+    add_column_if_missing(connection, "cached_issue_details", "milestone_state text")
+    add_column_if_missing(connection, "cached_issue_details", "created_at text")
+    add_column_if_missing(connection, "cached_issue_details", "closed_at text")
 
 
 def add_column_if_missing(connection: sqlite3.Connection, table_name: str, column_sql: str) -> None:
@@ -237,15 +267,15 @@ def replace_view_items(
     for payload in payloads:
         content = payload.get("content") or {}
         repository = content.get("repository") or {}
-        status_name = extract_status_name(payload)
+        status_name, status_field_name, status_option_id = extract_status_info(payload)
         item_key = str(payload.get("id") or payload.get("node_id") or content.get("id") or content.get("number"))
         connection.execute(
             """
             insert into cached_view_items(
                 project_key, view_number, item_key, issue_number, issue_title,
-                status_name, repository_name, item_json, updated_at
+                status_name, status_field_name, status_option_id, repository_name, item_json, updated_at
             )
-            values(?, ?, ?, ?, ?, ?, ?, ?, ?)
+            values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 project_key_value,
@@ -254,6 +284,8 @@ def replace_view_items(
                 content.get("number"),
                 content.get("title"),
                 status_name,
+                status_field_name,
+                status_option_id,
                 repository.get("full_name"),
                 json.dumps(payload),
                 updated_at,
@@ -279,12 +311,13 @@ def replace_issue_cache(
         seen_issue_keys.add(issue_key)
         connection.execute(
             """
-            insert into cached_issue_details(
-                project_key, repository_name, issue_number, item_key, issue_type, state, state_reason,
-                title, body, html_url, api_url, author_login, milestone_title, labels_json,
-                assignees_json, comments_count, remote_updated_at, issue_json, updated_at
-            )
-            values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                insert into cached_issue_details(
+                    project_key, repository_name, issue_number, item_key, issue_type, state, state_reason,
+                    title, body, html_url, api_url, author_login, milestone_title, milestone_description,
+                    milestone_due_on, milestone_state, labels_json, assignees_json, comments_count,
+                    created_at, closed_at, remote_updated_at, issue_json, updated_at
+                )
+            values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             on conflict(project_key, repository_name, issue_number) do update set
                 item_key = excluded.item_key,
                 issue_type = excluded.issue_type,
@@ -296,9 +329,14 @@ def replace_issue_cache(
                 api_url = excluded.api_url,
                 author_login = excluded.author_login,
                 milestone_title = excluded.milestone_title,
+                milestone_description = excluded.milestone_description,
+                milestone_due_on = excluded.milestone_due_on,
+                milestone_state = excluded.milestone_state,
                 labels_json = excluded.labels_json,
                 assignees_json = excluded.assignees_json,
                 comments_count = excluded.comments_count,
+                created_at = excluded.created_at,
+                closed_at = excluded.closed_at,
                 remote_updated_at = excluded.remote_updated_at,
                 issue_json = excluded.issue_json,
                 updated_at = excluded.updated_at
@@ -317,9 +355,14 @@ def replace_issue_cache(
                 issue_payload.get("url"),
                 (issue_payload.get("user") or {}).get("login"),
                 milestone.get("title"),
+                milestone.get("description"),
+                milestone.get("due_on"),
+                milestone.get("state"),
                 json.dumps(labels),
                 json.dumps(assignees),
                 int(issue_payload.get("comments") or 0),
+                issue_payload.get("created_at"),
+                issue_payload.get("closed_at"),
                 issue_payload.get("updated_at"),
                 json.dumps(issue_payload),
                 synced_at,
@@ -428,14 +471,19 @@ def fetch_cached_comment_index(
     return index
 
 
-def extract_status_name(payload: dict) -> str | None:
+def extract_status_info(payload: dict) -> tuple[str | None, str | None, str | None]:
     field_values = payload.get("field_values") or payload.get("fieldValues") or []
     for value in field_values:
         field = value.get("field") or {}
         if (field.get("name") or "").lower() == "status":
             option = value.get("option") or {}
-            return option.get("name") or value.get("name")
-    return None
+            return option.get("name") or value.get("name"), field.get("name"), option.get("id") or option.get("node_id")
+    return None, None, None
+
+
+def extract_status_name(payload: dict) -> str | None:
+    name, _, _ = extract_status_info(payload)
+    return name
 
 
 def infer_issue_type(issue_payload: dict) -> str:

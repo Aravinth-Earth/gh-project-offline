@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog and this project follows Semantic Versioning once it reaches stable public releases.
 
+## [0.2.0] - Unreleased
+
+### Added
+
+- Added `summary`, `labels`, and `milestones` commands for cached reporting views.
+- Expanded `find` with sorting, table/json/csv output, and selectable output fields.
+- Expanded `status` with recent sync history and the last persisted cache delta summary.
+- Enriched capability export with agent guidance, command behavior notes, and examples for key workflows.
+- Expanded cached metadata with milestone details, richer status metadata, and issue timestamps used by reporting and sorting.
+- Redesigned `start` so initial setup and existing-cache routing are clearly separated.
+
 ## [0.1.2] - 2026-03-14
 
 ### Added

@@ -32,8 +32,9 @@ What `start` does:
 - prompts for the project URL when needed
 - prompts for the PAT when the configured token env var is missing
 - validates access to the board
-- runs the first sync
-- clearly asks whether you want to continue into watch mode after setup and the first sync complete
+- runs the first sync only when the local cache does not already exist
+- clearly asks whether you want to continue into watch mode after initial setup completes
+- if cache already exists, routes you to an explicit next action: one-time sync, continuous watch, or exit
 - lets you keep or override the watch interval
 
 Useful `start` flags:
@@ -58,11 +59,11 @@ gh-project-offline start --project-url https://github.com/users/YOUR-OWNER/proje
 
 Think of the CLI as three main operating modes:
 
-- `start`: guided setup plus the first sync, with an optional opt-in handoff into `watch`
+- `start`: guided setup and routing command
 - `sync`: one manual refresh now, then exit
 - `watch`: continuous periodic sync until stopped
 
-`start` does not silently become continuous monitoring. It only enters `watch` if you explicitly opt in at the prompt.
+`start` does not silently become continuous monitoring, and it does not silently recheck existing cache data anymore. It only enters `watch` if you explicitly opt in or select watch from the existing-cache router prompt.
 
 `doctor`
 
@@ -98,7 +99,32 @@ Useful `watch` flags:
 gh-project-offline status
 ```
 
-Shows cache counts and the most recent sync result.
+Shows cache counts, the latest sync result, the latest cache-delta summary, and a short recent sync history.
+
+`summary`
+
+```powershell
+gh-project-offline summary --by status
+gh-project-offline summary --by repo --format json
+```
+
+Shows grouped cached counts by status, repo, milestone, label, assignee, state, or type.
+
+`labels`
+
+```powershell
+gh-project-offline labels
+```
+
+Shows cached label counts.
+
+`milestones`
+
+```powershell
+gh-project-offline milestones --format json
+```
+
+Shows cached milestone counts.
 
 `items`
 
@@ -158,6 +184,9 @@ Supported `find` flags:
 - `--match`: choose how repeated labels or assignees match, `all` or `any`
 - `--limit`: cap the printed rows
 - `--interactive`: build filters through prompts
+- `--sort`: order by repo, number, state, status, title, milestone, milestone due date, created, closed, or updated
+- `--format`: print as `text`, `table`, `json`, or `csv`
+- `--show`: choose output fields for table, json, or csv formats
 
 Examples:
 
@@ -166,6 +195,7 @@ gh-project-offline find --milestone "Sprint 3" --state open
 gh-project-offline find --label bug --label regression --match any
 gh-project-offline find --repo octocat/hello-world --assignee hubot
 gh-project-offline find --status "In Progress" --text offline
+gh-project-offline find --format json --sort updated --show repo,number,status,updated
 gh-project-offline find --interactive
 ```
 

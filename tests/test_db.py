@@ -6,6 +6,7 @@ from pathlib import Path
 
 from gh_project_offline.db import (
     connect,
+    extract_status_info,
     extract_status_name,
     infer_issue_type,
     replace_issue_cache,
@@ -29,13 +30,21 @@ class DatabaseTests(unittest.TestCase):
                     "body": "Need the whole issue body offline.",
                     "html_url": "https://github.com/octocat/hello-world/issues/42",
                     "url": "https://api.github.com/repos/octocat/hello-world/issues/42",
+                    "created_at": "2026-03-01T09:00:00Z",
+                    "updated_at": "2026-03-11T10:30:00Z",
+                    "closed_at": None,
                     "state": "open",
                     "state_reason": None,
                     "comments": 2,
                     "user": {"login": "octocat"},
                     "labels": [{"name": "bug"}],
                     "assignees": [{"login": "hubot"}],
-                    "milestone": {"title": "Sprint 1"},
+                    "milestone": {
+                        "title": "Sprint 1",
+                        "description": "Need this finished soon",
+                        "due_on": "2026-03-20T00:00:00Z",
+                        "state": "open",
+                    },
                 },
                 "comment_payloads": [
                     {
@@ -67,7 +76,8 @@ class DatabaseTests(unittest.TestCase):
                 status_rows = fetch_status_rows(connection)
                 issue_row = connection.execute(
                     """
-                    select repository_name, issue_number, title, milestone_title, comments_count
+                    select repository_name, issue_number, title, milestone_title, milestone_description,
+                           milestone_due_on, milestone_state, created_at, closed_at, comments_count
                     from cached_issue_details
                     """
                 ).fetchone()
@@ -81,6 +91,11 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(issue_row["issue_number"], 42)
         self.assertEqual(issue_row["title"], "Offline sync test")
         self.assertEqual(issue_row["milestone_title"], "Sprint 1")
+        self.assertEqual(issue_row["milestone_description"], "Need this finished soon")
+        self.assertEqual(issue_row["milestone_due_on"], "2026-03-20T00:00:00Z")
+        self.assertEqual(issue_row["milestone_state"], "open")
+        self.assertEqual(issue_row["created_at"], "2026-03-01T09:00:00Z")
+        self.assertIsNone(issue_row["closed_at"])
         self.assertEqual(issue_row["comments_count"], 2)
         self.assertEqual([row["author_login"] for row in comment_rows], ["hubot", "monalisa"])
 
@@ -122,14 +137,14 @@ class DatabaseTests(unittest.TestCase):
                             "field_values": [
                                 {
                                     "field": {"name": "Status"},
-                                    "option": {"name": "Todo"},
+                                    "option": {"id": "option-1", "name": "Todo"},
                                 }
                             ],
                         }
                     ],
                 )
                 item_row = connection.execute(
-                    "select issue_number, issue_title, status_name, repository_name from cached_view_items"
+                    "select issue_number, issue_title, status_name, status_field_name, status_option_id, repository_name from cached_view_items"
                 ).fetchone()
                 project_row = connection.execute("select owner, project_number from project_snapshot").fetchone()
 
@@ -138,7 +153,19 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(item_row["issue_number"], 42)
         self.assertEqual(item_row["issue_title"], "Offline item")
         self.assertEqual(item_row["status_name"], "Todo")
+        self.assertEqual(item_row["status_field_name"], "Status")
+        self.assertEqual(item_row["status_option_id"], "option-1")
         self.assertEqual(item_row["repository_name"], "octocat/hello-world")
+        self.assertEqual(
+            extract_status_info(
+                {
+                    "fieldValues": [
+                        {"field": {"name": "Status"}, "option": {"id": "option-2", "name": "In Progress"}},
+                    ]
+                }
+            ),
+            ("In Progress", "Status", "option-2"),
+        )
         self.assertEqual(
             extract_status_name(
                 {
