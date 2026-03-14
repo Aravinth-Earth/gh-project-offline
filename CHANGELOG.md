@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog and this project follows Semantic Versioning once it reaches stable public releases.
 
+## [0.1.1] - 2026-03-14
+
+### Changed
+
+- Added session log creation for `sync` and `watch`, not just `start`.
+- Improved runtime failure logging so session logs capture exception context and traceback details.
+- Made `watch` wait until GitHub rate limit reset by default, then resume the normal cycle.
+- Added `--no-rate-limit-wait` to `watch`, `start`, and `setup` for fail-fast behavior.
+- Improved `start` watch handoff wording so initial freshness waits and later watch cadence are clearer.
+- Clarified runtime log location, command roles, and PAT-handling guidance in the docs.
+
 ## [0.1.0] - 2026-03-11
 
 ### Added

@@ -21,7 +21,7 @@ $env:GITHUB_TOKEN = "your-classic-pat"
 gh-project-offline start --project-url https://github.com/users/YOUR-OWNER/projects/123/views/1
 ```
 
-That writes `.ghpo/config.toml`, validates access, runs the first sync, creates a timestamped session log under `.ghpo/logs/`, and can continue directly into watch mode.
+That writes `.ghpo/config.toml`, validates access, runs the first sync, creates a timestamped session log under `.ghpo/logs/`, and then explicitly asks whether you want to continue into watch mode.
 
 If the token is not already present in the configured env var, `start` will prompt for it without echoing it back to the terminal.
 
@@ -92,6 +92,8 @@ gh-project-offline watch --interval 15m
 
 Stop it with `Ctrl+C`.
 If the token env var is missing, `watch` will prompt for it when run interactively in a terminal.
+By default, if GitHub rate-limits `watch`, it waits until reset and then resumes the normal cycle.
+Use `--no-rate-limit-wait` if you prefer fail-fast behavior.
 
 ## Suggested acceptance checklist
 
@@ -113,11 +115,13 @@ Double-check that the board URL points to a Project v2 view and that the token c
 
 `start` looks stuck during hydration
 
-Open the latest file in `logs/`. The CLI and log now include timestamped hydration messages like `Hydrating issue 12/87` and `Fetching comments for owner/repo#123`, which help pinpoint the current item.
+Open the latest file in `.ghpo/logs/`. The CLI and log now include timestamped hydration messages like `Hydrating issue 12/87` and `Fetching comments for owner/repo#123`, which help pinpoint the current item.
 
 GitHub reports a rate limit
 
-The tool stops instead of auto-retrying. Follow the cooldown shown in the CLI or log, then rerun `gh-project-offline start` or `gh-project-offline sync`.
+For one-shot `sync`, the tool stops and shows the cooldown guidance.
+For `watch`, the default behavior is to wait until the rate limit resets and then continue the normal cycle.
+If you use `--no-rate-limit-wait`, `watch` will fail fast instead.
 
 `Views cached: 0` but items synced
 

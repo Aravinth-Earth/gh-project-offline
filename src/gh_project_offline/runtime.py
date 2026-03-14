@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import traceback
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -25,6 +26,11 @@ class RuntimeLogger:
     def write_only(self, message: str) -> None:
         line = f"[{log_timestamp()}] {message}"
         self._write_line(line)
+
+    def write_exception(self, context: str, exc: BaseException) -> None:
+        details = traceback.format_exception(type(exc), exc, exc.__traceback__)
+        for line in "".join(details).rstrip().splitlines():
+            self.write_only(line)
 
     def _write_line(self, line: str) -> None:
         self.log_path.parent.mkdir(parents=True, exist_ok=True)

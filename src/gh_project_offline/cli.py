@@ -9,6 +9,7 @@ import os
 import sqlite3
 import sys
 import time
+import traceback
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -182,16 +183,31 @@ def build_parser() -> argparse.ArgumentParser:
     start_parser.add_argument("--force", action="store_true", help="Prompt again and rebuild the cache from scratch.")
     start_parser.add_argument("--project-url", help="GitHub project or view URL to use for setup.")
     start_parser.add_argument("--token-env", default="GITHUB_TOKEN", help="Environment variable that stores the PAT.")
+    start_parser.add_argument(
+        "--no-rate-limit-wait",
+        action="store_true",
+        help="If watch mode is started from setup, fail fast on GitHub rate limit instead of waiting until reset.",
+    )
 
     setup_parser = subparsers.add_parser("setup", help="Alias for start.")
     setup_parser.add_argument("--force", action="store_true", help="Prompt again and rebuild the cache from scratch.")
     setup_parser.add_argument("--project-url", help="GitHub project or view URL to use for setup.")
     setup_parser.add_argument("--token-env", default="GITHUB_TOKEN", help="Environment variable that stores the PAT.")
+    setup_parser.add_argument(
+        "--no-rate-limit-wait",
+        action="store_true",
+        help="If watch mode is started from setup, fail fast on GitHub rate limit instead of waiting until reset.",
+    )
 
     subparsers.add_parser("sync", help="Run a single sync now.")
 
     watch_parser = subparsers.add_parser("watch", help="Run sync on an interval.")
     watch_parser.add_argument("--interval", help="Override config interval, like 15m or 1h.")
+    watch_parser.add_argument(
+        "--no-rate-limit-wait",
+        action="store_true",
+        help="Fail fast on GitHub rate limit instead of waiting until reset and resuming watch.",
+    )
 
     subparsers.add_parser("status", help="Show cache and sync status.")
     subparsers.add_parser("doctor", help="Validate local config and token setup without syncing.")
@@ -276,12 +292,18 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "sync":
             ensure_token_available(config)
-            with SyncProgressRenderer() as renderer:
-                summary = run_sync(
-                    config,
-                    progress=renderer.emit,
-                    sync_mode="manual_sync",
-                )
+            logger = create_run_logger(config.storage.logs_dir)
+            logger.emit(f"Session log created at {logger.log_path}")
+            try:
+                with SyncProgressRenderer() as renderer:
+                    summary = run_sync(
+                        config,
+                        progress=lambda message: emit_sync_feedback(message, logger=logger, renderer=renderer),
+                        sync_mode="manual_sync",
+                    )
+            except Exception as exc:
+                log_runtime_failure(logger, "Sync command failed", exc)
+                raise
             console_print(
                 "Sync complete. "
                 f"fields={summary.fields_count} views={summary.views_count} "
@@ -292,12 +314,23 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "watch":
             ensure_token_available(config)
             interval_seconds = parse_interval(args.interval or config.sync.interval)
-            console_print(f"Watching with interval={interval_seconds}s against {config.storage.database_path}")
+            logger = create_run_logger(config.storage.logs_dir)
+            logger.emit(f"Session log created at {logger.log_path}")
+            logger.emit(f"Watching with interval={interval_seconds}s against {config.storage.database_path}")
             try:
-                run_watch_loop(config, interval_seconds)
+                run_watch_loop(
+                    config,
+                    interval_seconds,
+                    logger=logger,
+                    auto_wait_on_rate_limit=not args.no_rate_limit_wait,
+                )
             except KeyboardInterrupt:
+                logger.emit("Watch mode stopped.")
                 console_print("Stopped.")
                 return 0
+            except Exception as exc:
+                log_runtime_failure(logger, "Watch command failed", exc)
+                raise
             return 0
 
         if args.command == "status":
@@ -739,6 +772,7 @@ def run_watch_loop(
     logger=None,
     wait_before_first_cycle: bool = False,
     first_wait_seconds: int | None = None,
+    auto_wait_on_rate_limit: bool = True,
 ) -> None:
     cycle_number = 0
     if wait_before_first_cycle:
@@ -754,12 +788,28 @@ def run_watch_loop(
             logger.emit(f"Watch cycle {cycle_number}: starting recheck sync.")
         else:
             console_print(f"Watch cycle {cycle_number}: starting recheck sync.")
-        with SyncProgressRenderer() as renderer:
-            summary = run_sync(
-                config,
-                progress=lambda message: emit_sync_feedback(message, logger=logger, renderer=renderer),
-                sync_mode="recheck",
-            )
+        try:
+            with SyncProgressRenderer() as renderer:
+                summary = run_sync(
+                    config,
+                    progress=lambda message: emit_sync_feedback(message, logger=logger, renderer=renderer),
+                    sync_mode="recheck",
+                )
+        except GitHubApiError as exc:
+            if not is_rate_limit_error(exc) or not auto_wait_on_rate_limit:
+                raise
+            wait_seconds = compute_rate_limit_wait_seconds(exc)
+            if logger is not None:
+                logger.emit(describe_rate_limit_wait(wait_seconds, exc))
+            else:
+                console_print(describe_rate_limit_wait(wait_seconds, exc))
+            render_wait_countdown(wait_seconds)
+            if logger is not None:
+                logger.emit(f"Watch cycle {cycle_number}: resuming after GitHub rate limit wait.")
+            else:
+                console_print(f"Watch cycle {cycle_number}: resuming after GitHub rate limit wait.")
+            cycle_number -= 1
+            continue
         done_message = (
             f"Watch cycle {cycle_number}: sync complete "
             f"items={summary.items_count} issues={summary.issues_count} comments={summary.comments_count}"
@@ -812,79 +862,105 @@ def run_start_flow(args: argparse.Namespace) -> int:
     config = load_config(args.config)
     logger = create_run_logger(config.storage.logs_dir)
     logger.emit(f"Session log created at {logger.log_path}")
-    token = prompt_token(config, force=args.force)
-    os.environ[config.github.token_env] = token
-
-    sync_mode = "initial_load"
-    if args.force:
-        reset_database(config.storage.database_path)
-        logger.emit("Forced reset requested. Local cache was cleared before sync.")
-    elif existing_config and has_existing_cache(config.storage.database_path):
-        sync_mode = "recheck"
-        logger.emit(f"Reusing existing project board cache at {config.storage.database_path}")
-    else:
-        logger.emit("No reusable local board cache found. Starting initial load.")
-
-    logger.emit(f"Validating access to {config.github.project_web_url}...")
-    client = GitHubClient(config)
     try:
-        client.fetch_project()
-    except GitHubApiError as exc:
-        print_pat_guidance(config, exc)
-        raise
-    logger.emit("GitHub access check passed.")
+        token = prompt_token(config, force=args.force)
+        os.environ[config.github.token_env] = token
 
-    interval_seconds = parse_interval(config.sync.interval)
-    recent_sync = get_recent_successful_sync_age(config.storage.database_path)
-    should_run_sync = True
-    wait_before_first_watch_cycle = True
-    first_watch_wait_seconds: int | None = None
-    if sync_mode == "recheck" and recent_sync is not None and recent_sync < interval_seconds:
-        remaining_seconds = max(interval_seconds - recent_sync, 0)
-        logger.emit(
-            f"Local cache freshness: last successful sync was {format_duration(recent_sync)} ago, "
-            f"inside the configured {config.sync.interval} interval."
-        )
-        should_wait = prompt_yes_no(
-            f"Local cache is fresh. Wait about {format_duration(remaining_seconds)} before the next recheck?",
-            default=True,
-        )
-        should_run_sync = not should_wait
-        if should_wait:
-            logger.emit(f"Skipping immediate recheck. Cache is recent; about {format_duration(remaining_seconds)} remains in this sync window.")
-            wait_before_first_watch_cycle = True
-            first_watch_wait_seconds = remaining_seconds
+        sync_mode = "initial_load"
+        if args.force:
+            reset_database(config.storage.database_path)
+            logger.emit("Forced reset requested. Local cache was cleared before sync.")
+        elif existing_config and has_existing_cache(config.storage.database_path):
+            sync_mode = "recheck"
+            logger.emit(f"Reusing existing project board cache at {config.storage.database_path}")
+        else:
+            logger.emit("No reusable local board cache found. Starting initial load.")
 
-    if should_run_sync:
-        with SyncProgressRenderer() as renderer:
-            summary = run_sync(
-                config,
-                progress=lambda message: emit_sync_feedback(message, logger=logger, renderer=renderer),
-                sync_mode=sync_mode,
-            )
-        logger.emit(
-            "Ready. "
-            f"fields={summary.fields_count} views={summary.views_count} "
-            f"items={summary.items_count} issues={summary.issues_count} comments={summary.comments_count}"
-        )
-    else:
-        logger.emit("Ready. Using the existing local cache without an immediate recheck.")
-    logger.emit("Next: use `gh-project-offline items`, `issues`, or `issue owner/repo 123`.")
-    if prompt_yes_no("Start watch mode now?", default=True):
-        interval_value = prompt_interval_override(config.sync.interval)
-        interval_seconds = parse_interval(interval_value)
-        logger.emit(f"Starting watch mode with interval={interval_seconds}s")
+        logger.emit(f"Validating access to {config.github.project_web_url}...")
+        client = GitHubClient(config)
         try:
-            run_watch_loop(
-                config,
-                interval_seconds,
-                logger=logger,
-                wait_before_first_cycle=wait_before_first_watch_cycle,
-                first_wait_seconds=first_watch_wait_seconds,
+            client.fetch_project()
+        except GitHubApiError as exc:
+            print_pat_guidance(config, exc)
+            raise
+        logger.emit("GitHub access check passed.")
+
+        interval_seconds = parse_interval(config.sync.interval)
+        recent_sync = get_recent_successful_sync_age(config.storage.database_path)
+        should_run_sync = True
+        wait_before_first_watch_cycle = True
+        first_watch_wait_seconds: int | None = None
+        if sync_mode == "recheck" and recent_sync is not None and recent_sync < interval_seconds:
+            remaining_seconds = max(interval_seconds - recent_sync, 0)
+            logger.emit(
+                f"Local cache freshness: last successful sync was {format_duration(recent_sync)} ago, "
+                f"inside the configured {config.sync.interval} interval."
             )
-        except KeyboardInterrupt:
-            logger.emit("Watch mode stopped.")
-    return 0
+            should_wait = prompt_yes_no(
+                f"Local cache is fresh. Wait about {format_duration(remaining_seconds)} before the next recheck?",
+                default=True,
+            )
+            should_run_sync = not should_wait
+            if should_wait:
+                logger.emit(
+                    f"Skipping immediate recheck. Cache is recent; about {format_duration(remaining_seconds)} remains in this sync window."
+                )
+                wait_before_first_watch_cycle = True
+                first_watch_wait_seconds = remaining_seconds
+
+        if should_run_sync:
+            with SyncProgressRenderer() as renderer:
+                summary = run_sync(
+                    config,
+                    progress=lambda message: emit_sync_feedback(message, logger=logger, renderer=renderer),
+                    sync_mode=sync_mode,
+                )
+            logger.emit(
+                "Ready. "
+                f"fields={summary.fields_count} views={summary.views_count} "
+                f"items={summary.items_count} issues={summary.issues_count} comments={summary.comments_count}"
+            )
+        else:
+            logger.emit("Ready. Using the existing local cache without an immediate recheck.")
+        should_start_watch = prompt_yes_no("Start watch mode now?", default=True)
+        if should_start_watch:
+            interval_prompt = "Watch interval"
+            if first_watch_wait_seconds is not None:
+                interval_prompt = (
+                    f"Watch interval after the initial {format_duration(first_watch_wait_seconds)} wait"
+                )
+            interval_value = prompt_interval_override(interval_prompt, config.sync.interval)
+            interval_seconds = parse_interval(interval_value)
+            logger.emit(f"Starting watch mode with interval={interval_seconds}s")
+            try:
+                run_watch_loop(
+                    config,
+                    interval_seconds,
+                    logger=logger,
+                    wait_before_first_cycle=wait_before_first_watch_cycle,
+                    first_wait_seconds=first_watch_wait_seconds,
+                    auto_wait_on_rate_limit=not args.no_rate_limit_wait,
+                )
+            except KeyboardInterrupt:
+                logger.emit("Watch mode stopped.")
+        else:
+            logger.emit("Next: use `gh-project-offline items`, `issues`, or `issue owner/repo 123`.")
+        return 0
+    except BaseException as exc:
+        log_runtime_failure(logger, "Start flow failed", exc)
+        raise
+
+
+def log_runtime_failure(logger: Any | None, context: str, exc: BaseException) -> None:
+    if logger is None:
+        return
+    logger.emit(f"{context}: {exc.__class__.__name__}: {exc}")
+    if hasattr(logger, "write_exception"):
+        logger.write_exception(context, exc)
+        return
+    details = traceback.format_exception(type(exc), exc, exc.__traceback__)
+    for line in "".join(details).rstrip().splitlines():
+        logger.write_only(line)
 
 
 def prompt_project_url(existing_config: AppConfig | None, *, force: bool) -> str:
@@ -951,8 +1027,8 @@ def prompt_yes_no(prompt: str, *, default: bool) -> bool:
         console_print("Please answer yes or no.")
 
 
-def prompt_interval_override(default_interval: str) -> str:
-    entered = input(f"Watch interval [{default_interval}]: ").strip()
+def prompt_interval_override(prompt_label: str, default_interval: str) -> str:
+    entered = input(f"{prompt_label} [{default_interval}]: ").strip()
     return entered or default_interval
 
 
@@ -1004,6 +1080,32 @@ def format_duration(total_seconds: int) -> str:
     if seconds == 0:
         return f"{hours}h {minutes}m"
     return f"{hours}h {minutes}m {seconds}s"
+
+
+def compute_rate_limit_wait_seconds(exc: GitHubApiError, *, now: datetime | None = None) -> int:
+    retry_after = exc.response_headers.get("Retry-After")
+    if retry_after and retry_after.isdigit():
+        return max(int(retry_after), 1)
+    reset_header = exc.response_headers.get("X-RateLimit-Reset")
+    if reset_header and reset_header.isdigit():
+        current = now or datetime.now(UTC)
+        wait_seconds = int(reset_header) - int(current.timestamp())
+        return max(wait_seconds, 1)
+    return 60
+
+
+def describe_rate_limit_wait(wait_seconds: int, exc: GitHubApiError) -> str:
+    reset_header = exc.response_headers.get("X-RateLimit-Reset")
+    if reset_header and reset_header.isdigit():
+        reset_local = datetime.fromtimestamp(int(reset_header)).strftime("%Y-%m-%d %H:%M:%S")
+        return (
+            "GitHub rate limit reached during watch. "
+            f"Waiting {format_duration(wait_seconds)} until about {reset_local} local time before resuming."
+        )
+    return (
+        "GitHub rate limit reached during watch. "
+        f"Waiting {format_duration(wait_seconds)} before resuming."
+    )
 
 
 def print_pat_guidance(config: AppConfig, exc: GitHubApiError) -> None:

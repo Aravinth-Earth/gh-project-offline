@@ -39,6 +39,7 @@ def make_sync_summary(**overrides) -> SyncSummary:
 
 
 def build_config(config_path: Path, database_path: Path) -> AppConfig:
+    logs_dir = (config_path.parent / "logs") if str(config_path.parent) not in {"", "."} else Path("logs")
     return AppConfig(
         config_path=config_path,
         github=GitHubConfig(
@@ -49,7 +50,7 @@ def build_config(config_path: Path, database_path: Path) -> AppConfig:
             token_env="GITHUB_TOKEN",
             project_url="https://github.com/users/octocat/projects/12/views/3",
         ),
-        storage=StorageConfig(database_path=database_path, logs_dir=database_path.parent / "logs"),
+        storage=StorageConfig(database_path=database_path, logs_dir=logs_dir),
         sync=SyncConfig(
             interval="15m",
             timeout_seconds=30,
@@ -221,6 +222,16 @@ class CliTests(unittest.TestCase):
         self.assertIsNone(cli.parse_hydration_scope("Something else"))
         self.assertIsNone(cli.parse_hydration_step("Something else"))
 
+    def test_rate_limit_wait_helpers(self) -> None:
+        exc = GitHubApiError(
+            "rate limited",
+            status_code=403,
+            response_body="API rate limit exceeded",
+            response_headers={"Retry-After": "12", "X-RateLimit-Reset": "1773250000"},
+        )
+        self.assertEqual(cli.compute_rate_limit_wait_seconds(exc), 12)
+        self.assertIn("Waiting 12s", cli.describe_rate_limit_wait(12, exc))
+
     def test_emit_sync_feedback_uses_log_only_when_renderer_is_present(self) -> None:
         logger = unittest.mock.Mock()
         renderer = unittest.mock.Mock()
@@ -246,6 +257,16 @@ class CliTests(unittest.TestCase):
         self.assertTrue(any("Project snapshot:" in line for line in outputs))
         self.assertTrue(any("Hydrating issues:" in line for line in outputs))
         self.assertTrue(any("added=1 updated=2 removed=3" in line for line in outputs))
+
+    def test_log_runtime_failure_records_traceback_to_logger(self) -> None:
+        logger = unittest.mock.Mock()
+        try:
+            raise OSError("timed out")
+        except OSError as exc:
+            cli.log_runtime_failure(logger, "Sync command failed", exc)
+
+        logger.emit.assert_called_once_with("Sync command failed: OSError: timed out")
+        logger.write_exception.assert_called_once()
 
     def test_main_init_writes_project_url_config(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -469,7 +490,7 @@ class CliTests(unittest.TestCase):
             ), patch(
                 "gh_project_offline.cli.prompt_interval_override",
                 return_value="15m",
-            ), patch(
+            ) as mock_prompt_interval, patch(
                 "gh_project_offline.cli.create_run_logger"
             ) as mock_create_logger, patch(
                 "gh_project_offline.cli.GitHubClient"
@@ -488,12 +509,14 @@ class CliTests(unittest.TestCase):
             self.assertEqual(exit_code, 0)
             mock_run_sync.assert_not_called()
             logger.emit.assert_any_call("Ready. Using the existing local cache without an immediate recheck.")
+            mock_prompt_interval.assert_called_once_with("Watch interval after the initial 13m wait", "15m")
             mock_watch.assert_called_once_with(
                 config,
                 900,
                 logger=logger,
                 wait_before_first_cycle=True,
                 first_wait_seconds=780,
+                auto_wait_on_rate_limit=True,
             )
 
     def test_start_can_force_recheck_even_when_cache_is_fresh(self) -> None:
@@ -574,9 +597,42 @@ class CliTests(unittest.TestCase):
                 logger=logger,
                 wait_before_first_cycle=True,
                 first_wait_seconds=None,
+                auto_wait_on_rate_limit=True,
             )
             logger.emit.assert_any_call("Starting watch mode with interval=1800s")
             logger.emit.assert_any_call("Watch mode stopped.")
+
+    def test_start_shows_next_commands_only_when_watch_is_declined(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_path = Path(tmp_dir) / APP_DIR_NAME / "config.toml"
+            database_path = config_path.parent / "data" / "cache.db"
+            write_config_file(config_path)
+            config = build_config(config_path, database_path)
+
+            with patch.dict("os.environ", {"GITHUB_TOKEN": "env-token"}, clear=False), patch(
+                "gh_project_offline.cli.load_config",
+                side_effect=[config, config],
+            ), patch(
+                "gh_project_offline.cli.write_default_config"
+            ), patch(
+                "gh_project_offline.cli.prompt_yes_no",
+                return_value=False,
+            ), patch(
+                "gh_project_offline.cli.create_run_logger"
+            ) as mock_create_logger, patch(
+                "gh_project_offline.cli.GitHubClient"
+            ) as mock_client_cls, patch(
+                "gh_project_offline.cli.run_sync",
+                return_value=make_sync_summary(),
+            ):
+                logger = mock_create_logger.return_value
+                logger.log_path = Path("logs/session-test.log")
+                mock_client = mock_client_cls.return_value
+                mock_client.fetch_project.return_value = {"id": "project-1"}
+                exit_code = cli.main(["--config", str(config_path), "start"])
+
+            self.assertEqual(exit_code, 0)
+            logger.emit.assert_any_call("Next: use `gh-project-offline items`, `issues`, or `issue owner/repo 123`.")
 
     def test_watch_command_starts_immediately_but_start_handoff_waits_first(self) -> None:
         config = build_config(Path(".ghpo/config.toml"), Path("cache.sqlite3"))
@@ -590,7 +646,22 @@ class CliTests(unittest.TestCase):
                 exit_code = cli.main(["watch", "--interval", "15m"])
 
         self.assertEqual(exit_code, 0)
-        mock_watch.assert_called_once_with(config, 900)
+        mock_watch.assert_called_once()
+        self.assertEqual(mock_watch.call_args.args[:2], (config, 900))
+        self.assertIn("logger", mock_watch.call_args.kwargs)
+        self.assertTrue(mock_watch.call_args.kwargs["auto_wait_on_rate_limit"])
+
+    def test_watch_command_can_disable_rate_limit_wait(self) -> None:
+        config = build_config(Path(".ghpo/config.toml"), Path("cache.sqlite3"))
+
+        with patch("gh_project_offline.cli.load_config", return_value=config), patch(
+            "gh_project_offline.cli.run_watch_loop",
+            side_effect=KeyboardInterrupt,
+        ) as mock_watch:
+            exit_code = cli.main(["watch", "--no-rate-limit-wait"])
+
+        self.assertEqual(exit_code, 0)
+        self.assertFalse(mock_watch.call_args.kwargs["auto_wait_on_rate_limit"])
 
     def test_start_force_prompts_for_values_and_resets_database(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -843,13 +914,19 @@ class CliTests(unittest.TestCase):
 
         stderr = io.StringIO()
         with redirect_stderr(stderr), patch("gh_project_offline.cli.load_config", return_value=config), patch(
+            "gh_project_offline.cli.create_run_logger"
+        ) as mock_create_logger, patch(
             "gh_project_offline.cli.run_sync",
             side_effect=GitHubApiError("boom"),
         ):
+            logger = mock_create_logger.return_value
+            logger.log_path = Path("logs/session-test.log")
             exit_code = cli.main(["sync"])
 
         self.assertEqual(exit_code, 1)
         self.assertIn("Sync failed: boom", stderr.getvalue())
+        logger.emit.assert_any_call(f"Session log created at {logger.log_path}")
+        logger.emit.assert_any_call("Sync command failed: GitHubApiError: boom")
 
         stderr = io.StringIO()
         with redirect_stderr(stderr), patch(
@@ -870,6 +947,135 @@ class CliTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 1)
         self.assertIn("Start failed: bad token", stderr.getvalue())
+
+    def test_start_logs_runtime_failure_before_returning_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_path = Path(tmp_dir) / APP_DIR_NAME / "config.toml"
+            database_path = config_path.parent / "data" / "cache.db"
+            write_config_file(config_path)
+            config = build_config(config_path, database_path)
+
+            stderr = io.StringIO()
+            with redirect_stderr(stderr), patch.dict("os.environ", {"GITHUB_TOKEN": "env-token"}, clear=False), patch(
+                "gh_project_offline.cli.load_config",
+                side_effect=[config, config],
+            ), patch(
+                "gh_project_offline.cli.write_default_config"
+            ), patch(
+                "gh_project_offline.cli.create_run_logger"
+            ) as mock_create_logger, patch(
+                "gh_project_offline.cli.GitHubClient"
+            ) as mock_client_cls, patch(
+                "gh_project_offline.cli.run_sync",
+                side_effect=OSError("The read operation timed out"),
+            ):
+                logger = mock_create_logger.return_value
+                logger.log_path = Path("logs/session-test.log")
+                mock_client = mock_client_cls.return_value
+                mock_client.fetch_project.return_value = {"id": "project-1"}
+                exit_code = cli.main(["--config", str(config_path), "start"])
+
+            self.assertEqual(exit_code, 1)
+            self.assertIn("I/O error: The read operation timed out", stderr.getvalue())
+            logger.emit.assert_any_call("Start flow failed: OSError: The read operation timed out")
+
+    def test_watch_logs_runtime_failure_before_returning_error(self) -> None:
+        config = build_config(Path(".ghpo/config.toml"), Path("cache.sqlite3"))
+
+        stderr = io.StringIO()
+        with redirect_stderr(stderr), patch("gh_project_offline.cli.load_config", return_value=config), patch(
+            "gh_project_offline.cli.create_run_logger"
+        ) as mock_create_logger, patch(
+            "gh_project_offline.cli.run_watch_loop",
+            side_effect=OSError("socket read timed out"),
+        ):
+            logger = mock_create_logger.return_value
+            logger.log_path = Path("logs/session-test.log")
+            exit_code = cli.main(["watch"])
+
+        self.assertEqual(exit_code, 1)
+        self.assertIn("I/O error: socket read timed out", stderr.getvalue())
+        logger.emit.assert_any_call("Watch command failed: OSError: socket read timed out")
+
+    def test_start_watch_handoff_can_disable_rate_limit_wait(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_path = Path(tmp_dir) / APP_DIR_NAME / "config.toml"
+            database_path = config_path.parent / "data" / "cache.db"
+            write_config_file(config_path)
+            config = build_config(config_path, database_path)
+
+            with patch.dict("os.environ", {"GITHUB_TOKEN": "env-token"}, clear=False), patch(
+                "gh_project_offline.cli.load_config",
+                side_effect=[config, config],
+            ), patch(
+                "gh_project_offline.cli.write_default_config"
+            ), patch(
+                "gh_project_offline.cli.prompt_yes_no",
+                return_value=True,
+            ), patch(
+                "gh_project_offline.cli.prompt_interval_override",
+                return_value="15m",
+            ), patch(
+                "gh_project_offline.cli.create_run_logger"
+            ) as mock_create_logger, patch(
+                "gh_project_offline.cli.GitHubClient"
+            ) as mock_client_cls, patch(
+                "gh_project_offline.cli.run_sync",
+                return_value=make_sync_summary(),
+            ), patch(
+                "gh_project_offline.cli.run_watch_loop",
+                side_effect=KeyboardInterrupt,
+            ) as mock_watch:
+                logger = mock_create_logger.return_value
+                logger.log_path = Path("logs/session-test.log")
+                mock_client = mock_client_cls.return_value
+                mock_client.fetch_project.return_value = {"id": "project-1"}
+                exit_code = cli.main(["--config", str(config_path), "start", "--no-rate-limit-wait"])
+
+            self.assertEqual(exit_code, 0)
+            self.assertFalse(mock_watch.call_args.kwargs["auto_wait_on_rate_limit"])
+
+    def test_run_watch_loop_waits_for_rate_limit_then_resumes(self) -> None:
+        config = build_config(Path(".ghpo/config.toml"), Path("cache.sqlite3"))
+        logger = unittest.mock.Mock()
+        rate_limit_exc = GitHubApiError(
+            "rate limited",
+            status_code=403,
+            response_body="secondary rate limit",
+            response_headers={"Retry-After": "2", "X-RateLimit-Reset": "1773250000"},
+        )
+
+        with patch(
+            "gh_project_offline.cli.run_sync",
+            side_effect=[rate_limit_exc, make_sync_summary(), RuntimeError("done")],
+        ), patch(
+            "gh_project_offline.cli.render_wait_countdown",
+            side_effect=[None, RuntimeError("done")],
+        ) as mock_wait:
+            with self.assertRaisesRegex(RuntimeError, "done"):
+                cli.run_watch_loop(config, 900, logger=logger)
+
+        self.assertEqual(mock_wait.call_args_list[0].args[0], 2)
+        self.assertTrue(
+            any(
+                "GitHub rate limit reached during watch. Waiting 2s until about" in call.args[0]
+                for call in logger.emit.call_args_list
+            )
+        )
+        logger.emit.assert_any_call("Watch cycle 1: resuming after GitHub rate limit wait.")
+
+    def test_run_watch_loop_can_fail_fast_on_rate_limit(self) -> None:
+        config = build_config(Path(".ghpo/config.toml"), Path("cache.sqlite3"))
+        rate_limit_exc = GitHubApiError(
+            "rate limited",
+            status_code=403,
+            response_body="API rate limit exceeded",
+            response_headers={"Retry-After": "5"},
+        )
+
+        with patch("gh_project_offline.cli.run_sync", side_effect=rate_limit_exc):
+            with self.assertRaises(GitHubApiError):
+                cli.run_watch_loop(config, 900, auto_wait_on_rate_limit=False)
 
     def test_start_prints_bad_credentials_guidance_for_user_project(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

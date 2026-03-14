@@ -44,9 +44,15 @@ gh-project-offline start --project-url https://github.com/users/YOUR-OWNER/proje
 - prompt for the PAT when the configured env var is missing
 - validate access to the target project
 - run the first sync with live progress in the CLI
-- optionally continue straight into watch mode
+- explicitly ask whether you want to continue into watch mode after setup and the first sync complete
 - let you keep or override the sync interval before watch starts
 - write runtime files under `.ghpo/`
+
+Command roles:
+
+- `start`: guided setup plus the first sync, with an optional handoff into `watch`
+- `sync`: one manual sync run, then exit
+- `watch`: continuous periodic sync until stopped
 
 Run periodic sync every 15 minutes:
 
@@ -72,7 +78,7 @@ logs_dir = "logs"
 [sync]
 interval = "15m"
 timeout_seconds = 30
-user_agent = "gh-project-offline/0.1.0"
+user_agent = "gh-project-offline/0.1.1"
 include_closed_items = false
 ```
 
@@ -118,7 +124,9 @@ If you already used an older root-level layout during local development, run `py
 
 By default, sync skips closed issues and pull requests during local caching. Set `include_closed_items = true` in config if you want the cache to include them too.
 
-If GitHub rate-limits the sync, the tool stops and tells you the suggested cooldown. It does not auto-retry by default.
+If GitHub rate-limits a one-shot sync, the tool stops and tells you the suggested cooldown.
+During `watch`, the default behavior is to wait until the reset window passes and then resume the normal cycle.
+Use `--no-rate-limit-wait` with `watch` or `start` if you prefer fail-fast behavior instead.
 Incremental sync also reuses cached issue/comment state when GitHub reports the item unchanged, so later syncs are much lighter than the first hydration run.
 
 ## Test with your board
@@ -130,7 +138,9 @@ For a newcomer-friendly command guide, see [docs/GETTING_STARTED.md](docs/GETTIN
 
 For user-owned Project v2 view endpoints, GitHub currently documents that a compatible classic-style personal access token is required rather than a fine-grained token or GitHub App token.
 
-For security, the app does not automatically persist the PAT into system-wide environment variables. The safer default is to prompt for it when needed and use it only in the current process unless the user explicitly chooses their own persistence method.
+For security, the app does not automatically persist the PAT into system-wide environment variables, `.env` files, or other repository-local files. The safer default is to prompt for it when needed and use it only in the current process unless the user explicitly chooses their own persistence method.
+
+This is primarily a security choice. It is even more important here because the GitHub endpoints used for some user-owned Project v2 flows may require a classic PAT rather than a narrower fine-grained token.
 
 ## Release docs
 
