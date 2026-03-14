@@ -26,11 +26,26 @@ python scripts/migrate_runtime_layout.py
 
 Prefer `pipx` in release notes for CLI users. `pip` still works for library-style installs.
 
-Example:
+Current recommended path:
+
+- GitHub release -> PyPI via Trusted Publishing
+
+Before relying on the workflow, configure Trusted Publishing on PyPI:
+
+- configure the PyPI trusted publisher for this GitHub repository and the `pypi` environment
+
+Manual fallback:
 
 ```powershell
 python -m twine upload dist/*
 ```
+
+Suggested rollout:
+
+1. configure the PyPI trusted publisher for this repository and environment
+2. create a normal GitHub release
+3. let the workflow publish to PyPI
+4. verify installation from PyPI
 
 ## 4. After release
 
