@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog and this project follows Semantic Versioning once it reaches stable public releases.
 
+## [0.1.2] - 2026-03-14
+
+### Added
+
+- Added `gh-project-offline capabilities` to export machine-readable CLI command and flag metadata for agent tools.
+- Added YAML and JSON capability export formats with configurable output path support.
+
 ## [0.1.1] - 2026-03-14
 
 ### Changed

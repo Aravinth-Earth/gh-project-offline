@@ -25,6 +25,7 @@ from rich.progress import (
 )
 from rich.table import Table
 
+from . import __version__
 from .config import DEFAULT_CONFIG_PATH, AppConfig, load_config, write_default_config
 from .db import connect
 from .github_api import GitHubApiError, GitHubClient
@@ -239,6 +240,22 @@ def build_parser() -> argparse.ArgumentParser:
     query_parser = subparsers.add_parser("query", help="Run a read-only SQL query against the cache.")
     query_parser.add_argument("sql", help="A read-only SELECT query.")
 
+    capabilities_parser = subparsers.add_parser(
+        "capabilities",
+        help="Export machine-readable CLI capability details for humans or agent tools.",
+    )
+    capabilities_parser.add_argument(
+        "--format",
+        choices=["yaml", "json"],
+        default="yaml",
+        help="Output format for the exported capability file.",
+    )
+    capabilities_parser.add_argument(
+        "--output",
+        type=Path,
+        help="Write the exported capability file to this path. Defaults to .ghpo/agent-capabilities.<format>.",
+    )
+
     return parser
 
 
@@ -437,6 +454,15 @@ def main(argv: list[str] | None = None) -> int:
                 cursor = connection.execute(sql)
                 print_rows(cursor)
             return 0
+
+        if args.command == "capabilities":
+            export_path = args.output or default_capabilities_output_path(args.config, args.format)
+            payload = build_capabilities_payload(parser)
+            rendered = render_capabilities(payload, output_format=args.format)
+            export_path.parent.mkdir(parents=True, exist_ok=True)
+            export_path.write_text(rendered, encoding="utf-8")
+            console_print(f"Wrote capability export to {export_path}")
+            return 0
     except GitHubApiError as exc:
         if is_rate_limit_error(exc):
             print_rate_limit_guidance(exc)
@@ -487,6 +513,120 @@ def print_rows(cursor: sqlite3.Cursor) -> None:
         row_count += 1
     CONSOLE.print(table)
     console_print(f"{row_count} row(s).")
+
+
+def default_capabilities_output_path(config_path: Path, output_format: str) -> Path:
+    suffix = "yaml" if output_format == "yaml" else "json"
+    return config_path.parent / f"agent-capabilities.{suffix}"
+
+
+def build_capabilities_payload(parser: argparse.ArgumentParser) -> dict[str, Any]:
+    command_parser = {
+        action.dest: action
+        for action in parser._actions
+        if isinstance(action, argparse._SubParsersAction)
+    }
+    subparsers_action = next(iter(command_parser.values()))
+    command_summaries = {
+        choice_action.dest: choice_action.help
+        for choice_action in getattr(subparsers_action, "_choices_actions", [])
+    }
+    commands: list[dict[str, Any]] = []
+    for command_name, command_parser in subparsers_action.choices.items():
+        commands.append(
+            {
+                "name": command_name,
+                "summary": command_summaries.get(command_name, "") or "",
+                "usage": command_parser.format_usage().strip().replace("usage: ", ""),
+                "arguments": collect_parser_arguments(command_parser),
+            }
+        )
+    commands.sort(key=lambda item: item["name"])
+    return {
+        "schema_version": 1,
+        "tool_name": "gh-project-offline",
+        "tool_version": __version__,
+        "purpose": "Local-first cache for GitHub Project data with offline inspection commands.",
+        "runtime_paths": {
+            "config": str(DEFAULT_CONFIG_PATH),
+            "database_default": ".ghpo/data/cache.db",
+            "logs_default": ".ghpo/logs/",
+        },
+        "command_roles": {
+            "start": "Guided setup plus first sync, with optional handoff into watch.",
+            "sync": "Run one sync now, then exit.",
+            "watch": "Run sync on an interval until stopped.",
+        },
+        "commands": commands,
+    }
+
+
+def collect_parser_arguments(command_parser: argparse.ArgumentParser) -> list[dict[str, Any]]:
+    arguments: list[dict[str, Any]] = []
+    for action in command_parser._actions:
+        if action.dest == "help":
+            continue
+        option_strings = list(action.option_strings)
+        names = option_strings or [action.dest]
+        argument: dict[str, Any] = {
+            "names": names,
+            "required": bool(getattr(action, "required", False)),
+            "help": action.help or "",
+        }
+        if action.metavar:
+            argument["metavar"] = action.metavar
+        elif option_strings:
+            argument["metavar"] = action.dest.upper()
+        if action.choices is not None:
+            argument["choices"] = list(action.choices)
+        if action.default is not None and action.default is not argparse.SUPPRESS and action.default is not False:
+            if not (isinstance(action.default, (list, tuple)) and len(action.default) == 0):
+                argument["default"] = action.default
+        arguments.append(argument)
+    return arguments
+
+
+def render_capabilities(payload: dict[str, Any], *, output_format: str) -> str:
+    if output_format == "json":
+        return json.dumps(payload, indent=2) + "\n"
+    return render_yaml(payload)
+
+
+def render_yaml(value: Any, *, indent: int = 0) -> str:
+    prefix = " " * indent
+    if isinstance(value, dict):
+        lines: list[str] = []
+        for key, item in value.items():
+            if isinstance(item, (dict, list)):
+                lines.append(f"{prefix}{key}:")
+                lines.append(render_yaml(item, indent=indent + 2))
+            else:
+                lines.append(f"{prefix}{key}: {yaml_scalar(item)}")
+        return "\n".join(lines)
+    if isinstance(value, list):
+        lines = []
+        for item in value:
+            if isinstance(item, (dict, list)):
+                rendered = render_yaml(item, indent=indent + 2).splitlines()
+                child_prefix = " " * (indent + 2)
+                first_line = rendered[0][len(child_prefix):] if rendered[0].startswith(child_prefix) else rendered[0]
+                lines.append(f"{prefix}- {first_line}")
+                lines.extend(rendered[1:])
+            else:
+                lines.append(f"{prefix}- {yaml_scalar(item)}")
+        return "\n".join(lines)
+    return f"{prefix}{yaml_scalar(value)}"
+
+
+def yaml_scalar(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    if value is None:
+        return "null"
+    text = str(value)
+    return json.dumps(text)
 
 
 def fetch_find_rows(connection: sqlite3.Connection, *, limit: int) -> list[sqlite3.Row]:
