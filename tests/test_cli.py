@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import io
+import json
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
-from gh_project_offline import cli
+from gh_project_offline import __version__, cli
 from gh_project_offline.config import (
     APP_DIR_NAME,
     AppConfig,
@@ -801,6 +802,124 @@ class CliTests(unittest.TestCase):
             self.assertIn("Comments:", output)
             self.assertIn("repository_name", output)
             self.assertIn("issue_number", output)
+
+    def test_capabilities_command_writes_yaml_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config_path = tmp_path / APP_DIR_NAME / "config.toml"
+            config_path.parent.mkdir(parents=True, exist_ok=True)
+            config_path.write_text(render_default_config(), encoding="utf-8")
+
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                exit_code = cli.main(["--config", str(config_path), "capabilities"])
+
+            output_path = config_path.parent / "agent-capabilities.yaml"
+            self.assertEqual(exit_code, 0)
+            self.assertTrue(output_path.exists())
+            rendered = output_path.read_text(encoding="utf-8")
+            self.assertIn('tool_name: "gh-project-offline"', rendered)
+            self.assertIn(f'tool_version: "{__version__}"', rendered)
+            self.assertIn('name: "start"', rendered)
+            self.assertIn('usage: "gh-project-offline start', rendered)
+            self.assertIn("Wrote capability export", stdout.getvalue())
+
+    def test_capabilities_command_writes_json_to_custom_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config_path = tmp_path / APP_DIR_NAME / "config.toml"
+            config_path.parent.mkdir(parents=True, exist_ok=True)
+            config_path.write_text(render_default_config(), encoding="utf-8")
+            output_path = tmp_path / "capabilities.json"
+
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                exit_code = cli.main(
+                    [
+                        "--config",
+                        str(config_path),
+                        "capabilities",
+                        "--format",
+                        "json",
+                        "--output",
+                        str(output_path),
+                    ]
+                )
+
+            self.assertEqual(exit_code, 0)
+            self.assertTrue(output_path.exists())
+            payload = json.loads(output_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["tool_name"], "gh-project-offline")
+            self.assertEqual(payload["tool_version"], __version__)
+            self.assertTrue(any(command["name"] == "watch" for command in payload["commands"]))
+            self.assertTrue(any(command["usage"].startswith("gh-project-offline watch") for command in payload["commands"]))
+            self.assertIn(str(output_path), stdout.getvalue())
+
+    def test_capabilities_export_covers_commands_and_representative_arguments(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config_path = tmp_path / APP_DIR_NAME / "config.toml"
+            config_path.parent.mkdir(parents=True, exist_ok=True)
+            config_path.write_text(render_default_config(), encoding="utf-8")
+            output_path = tmp_path / "capabilities.json"
+
+            exit_code = cli.main(
+                [
+                    "--config",
+                    str(config_path),
+                    "capabilities",
+                    "--format",
+                    "json",
+                    "--output",
+                    str(output_path),
+                ]
+            )
+
+            self.assertEqual(exit_code, 0)
+            payload = json.loads(output_path.read_text(encoding="utf-8"))
+            commands = {command["name"]: command for command in payload["commands"]}
+
+            self.assertEqual(
+                set(commands),
+                {
+                    "capabilities",
+                    "doctor",
+                    "find",
+                    "init",
+                    "issue",
+                    "issues",
+                    "items",
+                    "query",
+                    "setup",
+                    "start",
+                    "status",
+                    "sync",
+                    "watch",
+                },
+            )
+
+            find_arguments = {tuple(argument["names"]): argument for argument in commands["find"]["arguments"]}
+            self.assertIn(("--status", "--column"), find_arguments)
+            self.assertEqual(find_arguments[("--status", "--column")]["metavar"], "STATUS")
+            self.assertEqual(find_arguments[("--match",)]["choices"], ["all", "any"])
+            self.assertEqual(find_arguments[("--match",)]["default"], "all")
+            self.assertEqual(find_arguments[("--limit",)]["default"], 20)
+
+            watch_arguments = {tuple(argument["names"]): argument for argument in commands["watch"]["arguments"]}
+            self.assertIn(("--interval",), watch_arguments)
+            self.assertIn(("--no-rate-limit-wait",), watch_arguments)
+
+            issue_arguments = {tuple(argument["names"]): argument for argument in commands["issue"]["arguments"]}
+            self.assertTrue(issue_arguments[("repository",)]["required"])
+            self.assertTrue(issue_arguments[("number",)]["required"])
+            self.assertEqual(issue_arguments[("--comments",)]["default"], 5)
+
+            capabilities_arguments = {
+                tuple(argument["names"]): argument for argument in commands["capabilities"]["arguments"]
+            }
+            self.assertEqual(capabilities_arguments[("--format",)]["choices"], ["yaml", "json"])
+            self.assertEqual(capabilities_arguments[("--format",)]["default"], "yaml")
+            self.assertIn("--output", capabilities_arguments[("--output",)]["names"])
 
     def test_find_supports_flag_filters(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gh-project-offline"
-version = "0.1.1"
+version = "0.1.2"
 description = "Local-first cache for GitHub Project data with ad hoc and periodic sync."
 readme = "README.md"
 requires-python = ">=3.11"

@@ -78,7 +78,7 @@ logs_dir = "logs"
 [sync]
 interval = "15m"
 timeout_seconds = 30
-user_agent = "gh-project-offline/0.1.1"
+user_agent = "gh-project-offline/0.1.2"
 include_closed_items = false
 ```
 
@@ -100,6 +100,10 @@ You can still set `owner`, `owner_type`, `project_number`, and `view_number` exp
 - `gh-project-offline find --interactive`
 - `gh-project-offline issue owner/repo 123`
 - `gh-project-offline query "select * from cached_issue_details limit 5"`
+- `gh-project-offline capabilities --format yaml`
+- `gh-project-offline capabilities --format json --output .ghpo/agent-capabilities.json`
+
+The `capabilities` command exports the installed CLI's current commands, arguments, and usage in an agent-friendly format so a repo can reference the generated file from `AGENTS.md` instead of rediscovering flags from `--help` every time.
 
 ## Cached data
 

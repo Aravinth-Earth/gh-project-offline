@@ -76,7 +76,7 @@ logs_dir = "logs"
 [sync]
 interval = "15m"
 timeout_seconds = 30
-user_agent = "gh-project-offline/0.1.1"
+user_agent = "gh-project-offline/0.1.2"
 include_closed_items = false
 """
 
