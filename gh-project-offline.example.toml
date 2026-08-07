@@ -1,3 +1,5 @@
+# Config is read at process start. Changes require restarting watch/sync.
+
 [github]
 project_url = "https://github.com/users/YOUR-OWNER/projects/123/views/1"
 token_env = "GITHUB_TOKEN"

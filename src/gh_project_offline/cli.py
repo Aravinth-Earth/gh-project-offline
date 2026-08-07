@@ -203,7 +203,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser("sync", help="Run a single sync now.")
 
-    watch_parser = subparsers.add_parser("watch", help="Run sync on an interval.")
+    watch_parser = subparsers.add_parser("watch", help="Run sync on an interval. Config is read at start; restart to apply changes.")
     watch_parser.add_argument("--interval", help="Override config interval, like 15m or 1h.")
     watch_parser.add_argument(
         "--no-rate-limit-wait",
@@ -625,6 +625,7 @@ def build_capabilities_payload(parser: argparse.ArgumentParser) -> dict[str, Any
         ],
         "watch": [
             "By default, watch waits for GitHub rate-limit reset and then resumes the normal interval.",
+            "Config is read once at process start. Edit config.toml, then restart watch to apply changes.",
         ],
     }
     command_examples = {

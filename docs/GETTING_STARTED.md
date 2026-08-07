@@ -93,6 +93,8 @@ Useful `watch` flags:
 
 - `--interval`: override the configured interval, like `15m`, `30m`, `1h`, or `45s`
 
+Config is read once at process start. Edit `config.toml`, then restart `watch` to apply changes.
+
 `status`
 
 ```powershell
