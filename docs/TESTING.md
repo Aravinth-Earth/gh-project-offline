@@ -133,6 +133,8 @@ For one-shot `sync`, the tool stops and shows the cooldown guidance.
 For `watch`, the default behavior is to wait until the rate limit resets and then continue the normal cycle.
 If you use `--no-rate-limit-wait`, `watch` will fail fast instead.
 
+Config is read once at process start. Changes to `config.toml` require restarting `watch` or `sync`.
+
 `Views cached: 0` but items synced
 
 Some environments expose item sync without returning view metadata cleanly. This is acceptable for alpha testing if `items`, `issues`, and `issue` work.

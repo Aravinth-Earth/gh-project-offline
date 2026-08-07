@@ -135,6 +135,8 @@ If you already used an older root-level layout during local development, run `py
 
 By default, sync skips closed issues and pull requests during local caching. Set `include_closed_items = true` in config if you want the cache to include them too.
 
+Config is read at process start. Changes to `config.toml` require restarting `watch` or `sync`.
+
 If GitHub rate-limits a one-shot sync, the tool stops and tells you the suggested cooldown.
 During `watch`, the default behavior is to wait until the reset window passes and then resume the normal cycle.
 Use `--no-rate-limit-wait` with `watch` or `start` if you prefer fail-fast behavior instead.
